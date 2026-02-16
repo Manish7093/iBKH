@@ -1,0 +1,1197 @@
+parakit
+
+
+1. Create engine/sttgstparakeet.py
+import logging
+import threading
+import queue
+import numpy as np
+import re
+
+from pathlib import Path
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttparakeetmodel import STTParakeetModel
+
+LOG_MSG = logging.getLogger()
+SPECIAL_PATTERN = re.compile(r'^(?:\[[^\]]+\]|\([^)]+\))$', re.IGNORECASE)
+
+try:
+    import nemo.collections.asr as nemo_asr
+    PARAKEET_AVAILABLE = True
+except ImportError:
+    LOG_MSG.warning("NeMo not available. Install with: pip install nemo_toolkit[asr]")
+    PARAKEET_AVAILABLE = False
+
+
+class STTGstParakeet(STTGstBase):
+    __gtype_name__ = 'STTGstParakeet'
+    _pipeline_def = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                    "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                    "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
+                    "queue ! " \
+                    "appsink name=ParakeetSink emit-signals=true sync=false"
+
+    _pipeline_def_alt = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                        "queue ! " \
+                        "appsink name=ParakeetSink emit-signals=true sync=false"
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstParakeet._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstParakeet._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("ParakeetSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model = None
+        self._parakeet = None
+        self._set_model()
+
+        self._audio_buffer = []
+        self._buffer_duration = 0.0
+        self._max_buffer_duration = 5.0
+        self._min_buffer_duration = 1.5
+        self._sample_rate = 16000
+        self._processing = False
+        self._process_queue = queue.Queue()
+        self._process_thread = None
+        self._stop_processing = False
+
+        self._use_partial_results = False
+
+    def __del__(self):
+        LOG_MSG.info("Parakeet __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._appsink = None
+        self._parakeet = None
+
+        LOG_MSG.info("Parakeet.destroy() called")
+        super().destroy()
+
+    def _load_parakeet_model(self, model_path):
+        """Load Parakeet model using NeMo"""
+        if not PARAKEET_AVAILABLE:
+            LOG_MSG.error("NeMo not available")
+            return False
+
+        try:
+            LOG_MSG.info("Loading Parakeet model: %s", model_path)
+            
+            # Load the ASR model
+            self._parakeet = nemo_asr.models.EncDecRNNTBPEModel.restore_from(model_path)
+            
+            # Set model to eval mode
+            self._parakeet.eval()
+            
+            # Freeze model for inference
+            self._parakeet.freeze()
+            
+            LOG_MSG.info("Parakeet model loaded successfully")
+            return True
+            
+        except Exception as e:
+            LOG_MSG.error("Failed to load Parakeet model: %s", e)
+            self._parakeet = None
+            return False
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info("model path does not exist (%s - %s)",
+                        self._model.get_name() if self._model else "None",
+                        self._model.get_path() if self._model else "None")
+            self._parakeet = None
+            self.emit("model-changed")
+            return
+
+        new_model_path = self._model.get_path()
+        LOG_MSG.debug("model ready %s", new_model_path)
+
+        # Load the model
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        success = self._load_parakeet_model(new_model_path)
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
+
+        if success:
+            self.emit("model-changed")
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if self._model is not None and \
+           self._model.get_locale() == self._current_locale.locale:
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._model = STTParakeetModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    def _on_new_sample(self, appsink):
+        """Callback when new audio sample arrives"""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_data = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        self._audio_buffer.append(audio_data)
+        self._buffer_duration += len(audio_data) / self._sample_rate
+
+        if self._buffer_duration >= self._max_buffer_duration:
+            self._process_audio_buffer()
+
+        return Gst.FlowReturn.OK
+
+    def _process_audio_buffer(self):
+        """Process accumulated audio buffer"""
+        if len(self._audio_buffer) == 0:
+            return
+
+        if self._buffer_duration < self._min_buffer_duration:
+            LOG_MSG.debug("Buffer too short (%.2fs), waiting for more audio", self._buffer_duration)
+            return
+
+        if self._parakeet is None:
+            LOG_MSG.warning("Parakeet model not loaded")
+            self._audio_buffer.clear()
+            self._buffer_duration = 0.0
+            return
+
+        audio = np.concatenate(self._audio_buffer)
+        self._audio_buffer.clear()
+        self._buffer_duration = 0.0
+
+        LOG_MSG.debug("Processing audio buffer: %d samples (%.2f seconds)", 
+                     len(audio), len(audio) / self._sample_rate)
+
+        audio_float = audio.astype(np.float32) / 32768.0
+
+        self._process_queue.put(audio_float)
+
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
+            self._process_thread.start()
+
+    def _process_worker(self):
+        """Background worker to process audio"""
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._parakeet is None:
+                self._process_queue.task_done()
+                continue
+
+            try:
+                LOG_MSG.debug("Starting transcription of %d samples", len(audio))
+                
+                # Convert to tensor format expected by NeMo
+                import torch
+                audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+                audio_len = torch.tensor([len(audio)])
+                
+                # Transcribe
+                with torch.no_grad():
+                    hypotheses = self._parakeet.transcribe(
+                        audio=audio_tensor,
+                        audio_len=audio_len,
+                        return_hypotheses=False
+                    )
+                
+                if isinstance(hypotheses, list) and len(hypotheses) > 0:
+                    text = hypotheses[0]
+                elif isinstance(hypotheses, str):
+                    text = hypotheses
+                else:
+                    text = ""
+                
+                text = text.strip()
+                
+                # Filter out special tokens
+                if SPECIAL_PATTERN.match(text):
+                    text = ""
+
+                if text:
+                    LOG_MSG.info("Parakeet transcription result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed from audio")
+
+            except Exception as e:
+                LOG_MSG.error("Parakeet transcription error: %s", e, exc_info=True)
+
+            self._process_queue.task_done()
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False
+
+    def get_final_results(self):
+        if len(self._audio_buffer) > 0:
+            self._process_audio_buffer()
+        self._process_queue.join()
+
+    def get_results(self):
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+
+2. Create engine/sttparakeetmodel.py
+import json
+import logging
+
+from pathlib import Path
+from gi.repository import GObject, Gio
+from sttparakeetmodelmanagers import stt_parakeet_local_model_manager
+
+LOG_MSG = logging.getLogger()
+
+class STTParakeetModel(GObject.Object):
+    __gtype_name__ = "STTParakeetModel"
+    __gsignals__ = {
+        "changed": (GObject.SIGNAL_RUN_FIRST, None, ()),
+    }
+
+    def __init__(self, locale_str=None):
+        super().__init__()
+
+        self._locale_str = locale_str
+        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._settings_id = self._settings.connect("changed::parakeet-models", self._models_changed)
+
+        self._model_name = None
+        self._model_path = None
+        self._valid_model = False
+
+        model = self._get_model_from_settings()
+        self._set_model(model)
+
+        self._model_path_added_id = stt_parakeet_local_model_manager().connect("added", self._model_added_cb)
+        self._model_path_removed_id = stt_parakeet_local_model_manager().connect("removed", self._model_removed_cb)
+
+    def __del__(self):
+        stt_parakeet_local_model_manager().disconnect(self._model_path_added_id)
+        stt_parakeet_local_model_manager().disconnect(self._model_path_removed_id)
+        if self._model_name is None and self._model_path is not None:
+            stt_parakeet_local_model_manager().unregister_custom_model_path(self._model_path)
+
+    def _get_model_from_settings(self):
+        models_json_string = self._settings.get_string("parakeet-models")
+        if models_json_string in (None, "None", ""):
+            return None
+
+        models_dict = json.loads(models_json_string)
+        return models_dict.get(self._locale_str, None)
+
+    def _set_model(self, model):
+        LOG_MSG.debug("new model (%s, current path=%s / current name=%s)",
+                     model, self._model_path, self._model_name)
+        if model is None:
+            if self._model_name is None and self._model_path is None:
+                return
+
+            self._model_name = None
+            self._model_path = None
+            self._valid_model = False
+
+            self.emit("changed")
+            return
+
+        model = model.rstrip("/")
+        model_name = self._model_name
+        model_path = self._model_path
+
+        if Path(model).is_absolute() is True:
+            if self._model_name is None and self._model_path == model:
+                return
+
+            self._model_name = None
+            self._model_path = model
+            stt_parakeet_local_model_manager().register_custom_model_path(model, self._locale_str)
+            self._valid_model = stt_parakeet_local_model_manager().path_available(model)
+        else:
+            tmp_model_path = stt_parakeet_local_model_manager().get_best_path_for_model(model)
+            if self._model_name == model and tmp_model_path == model_path:
+                return
+
+            self._model_name = model
+            self._model_path = tmp_model_path
+            self._valid_model = bool(tmp_model_path is not None)
+
+        if model_path not in [self._model_path, None] and model_name is None:
+            stt_parakeet_local_model_manager().unregister_custom_model_path(model_path)
+
+        LOG_MSG.debug("model changed (valid=%i, current path=%s - current name=%s)",
+                     self._valid_model, self._model_path, self._model_name)
+        self.emit("changed")
+
+    def _models_changed(self, settings, key):
+        model = self._get_model_from_settings()
+        self._set_model(model)
+
+    def _model_added_cb(self, manager, name, path):
+        if self._model_name is not None:
+            if name != self._model_name:
+                return
+
+            model_path = stt_parakeet_local_model_manager().get_best_path_for_model(name)
+            if self._model_path == model_path:
+                return
+
+            self._model_path = model_path
+        elif self._model_path != path:
+            return
+
+        self._valid_model = True
+        self.emit("changed")
+
+    def _model_removed_cb(self, manager, name, path):
+        if self._model_name is not None:
+            if name != self._model_name:
+                return
+
+            if self._model_path != path:
+                return
+
+            self._model_path = stt_parakeet_local_model_manager().get_best_path_for_model(name)
+            self._valid_model = bool(self._model_path is not None)
+        elif self._model_path == path:
+            self._valid_model = False
+        else:
+            return
+
+        self.emit("changed")
+
+    def available(self):
+        return self._valid_model
+
+    def get_locale(self):
+        return self._locale_str
+
+    def get_name(self):
+        return self._model_name
+
+    def get_path(self):
+        return self._model_path
+
+    def set_name(self, model_name):
+        self._set_model(model_name)
+
+        models_json_string = self._settings.get_string("parakeet-models")
+        if models_json_string in (None, "None", ""):
+            models_dict = {}
+        else:
+            models_dict = json.loads(models_json_string)
+
+        models_dict[self._locale_str] = model_name
+        models_json_string = json.dumps(models_dict)
+
+        self._settings.disconnect(self._settings_id)
+        self._settings.set_string("parakeet-models", models_json_string)
+        self._settings_id = self._settings.connect("changed::parakeet-models", self._models_changed)
+
+
+
+
+
+3. Create engine/sttparakeetmodelmanagers.py
+
+
+import os
+import json
+import logging
+from pathlib import Path
+import urllib.request
+from enum import Enum
+import tempfile
+import shutil
+import uuid
+import threading
+
+from gi.repository import GObject, Gio, GLib
+
+LOG_MSG = logging.getLogger()
+
+# Parakeet model directories
+MODEL_DIRS = [
+    os.getenv('PARAKEET_MODEL_PATH'),
+    Path.home() / '.cache/parakeet',
+    Path('/usr/share/parakeet'),
+    Path('/usr/local/share/parakeet')
+]
+
+# HuggingFace model repository
+MODEL_PRE_URL = 'https://huggingface.co/nvidia/'
+PARAKEET_MODELS = {
+    'parakeet-tdt-0.6b': 'parakeet-tdt-0.6b',
+    'parakeet-tdt-0.6b-v2': 'parakeet-tdt-0.6b-v2',
+    'parakeet-tdt-1.1b': 'parakeet-tdt-1.1b',
+}
+
+DOWNLOADED_MODEL_SUFFIX = ".downloaded_model_tmp"
+
+def _helper_locale_normalize(locale_str):
+    lang = locale_str[0:2].lower()
+    if len(locale_str) < 5:
+        return lang
+    lang2 = locale_str[3:5]
+    return lang + "_" + lang2.upper()
+
+class STTDownloadState(float, Enum):
+    STOPPED = -1.0
+    UNKNOWN_PROGRESS = -0.5
+    UNPACKING = -0.6
+    ONGOING = 0.0
+
+class STTParakeetModelDescription(GObject.Object):
+    __gtype_name__ = "STTParakeetModelDescription"
+
+    def __init__(self, init_model=None):
+        super().__init__()
+        self.name = init_model.name if init_model is not None else ""
+        self.custom = init_model.custom if init_model is not None else False
+        self.is_obsolete = False
+        self.paths = init_model.paths if init_model is not None else []
+        self.size = init_model.size if init_model is not None else ""
+        self.type = init_model.type if init_model is not None else ""
+        self.locale = init_model.locale if init_model is not None else "multilingual"
+        self.url = init_model.url if init_model is not None else ""
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+
+    def _download_finished(self):
+        if self._operation.is_cancelled():
+            self._operation = None
+
+    def _download_model_thread(self, download_link, destination, status):
+        """Download model from HuggingFace using git"""
+        try:
+            import subprocess
+            
+            # Create destination parent directory
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Use huggingface-cli to download
+            LOG_MSG.info("Downloading model from HuggingFace: %s", download_link)
+            
+            # Extract repo name from URL
+            repo_name = download_link.replace(MODEL_PRE_URL, '')
+            
+            # Download using huggingface-cli
+            cmd = [
+                'huggingface-cli', 'download',
+                f'nvidia/{repo_name}',
+                '--local-dir', str(destination),
+                '--local-dir-use-symlinks', 'False'
+            ]
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            while True:
+                if status.is_cancelled():
+                    process.terminate()
+                    if destination.exists():
+                        shutil.rmtree(destination)
+                    return
+                
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                    
+                if output:
+                    LOG_MSG.debug("Download output: %s", output.strip())
+                    # Try to extract progress if available
+                    self.download_progress = STTDownloadState.UNKNOWN_PROGRESS
+            
+            if process.returncode == 0:
+                LOG_MSG.info("Model downloaded successfully")
+            else:
+                error = process.stderr.read()
+                LOG_MSG.error("Download failed: %s", error)
+                if destination.exists():
+                    shutil.rmtree(destination)
+                    
+        except Exception as e:
+            LOG_MSG.error("Download error: %s", e)
+            if destination.exists():
+                shutil.rmtree(destination)
+
+        self.download_progress = STTDownloadState.STOPPED
+        GLib.idle_add(self._download_finished)
+
+    def stop_downloading(self):
+        if self._operation is not None:
+            self._operation.cancel()
+
+    def start_downloading(self):
+        if self._operation is not None:
+            return
+
+        LOG_MSG.debug("start downloading model (%s)", self.url)
+
+        self.download_progress = STTDownloadState.ONGOING
+        self._operation = Gio.Cancellable()
+
+        download_thread = threading.Thread(
+            target=self._download_model_thread,
+            args=(self.url, Path(MODEL_DIRS[1], self.name), self._operation)
+        )
+        download_thread.start()
+
+    def get_best_path_for_model(self):
+        if self.paths in [None, []]:
+            return None
+        return self.paths[0]
+
+    def delete_paths(self):
+        if self.custom is True:
+            return
+
+        for path in self.paths:
+            if Path(path).parent == MODEL_DIRS[1] and self.url is not None:
+                try:
+                    shutil.rmtree(path)
+                except Exception as e:
+                    LOG_MSG.error("Failed to delete %s: %s", path, e)
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+        self.paths = []
+
+class STTParakeetLocalModelManager(GObject.Object):
+    __gtype_name__ = "STTParakeetLocalModelManager"
+
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (str, str,)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (str, str,)),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._monitors = []
+        self._models_dict = {}
+        self._locales_dict = {}
+        self._model_paths_dict = {}
+        self._get_available_local_models()
+        self._custom_paths = {}
+
+    def _add_model_description_to_locale(self, model_desc):
+        if model_desc.locale is None:
+            return
+
+        models_list = self._locales_dict.get(model_desc.locale, None)
+        if models_list is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            models_list.append(model_desc)
+
+    def _new_model_available(self, model_path):
+        if str(model_path).endswith(DOWNLOADED_MODEL_SUFFIX):
+            LOG_MSG.debug("model path is a temporary directory (%s)", model_path)
+            return None
+
+        if not model_path.is_dir():
+            LOG_MSG.debug("model path is not a directory (%s)", model_path)
+            return None
+
+        # Check if it's a valid NeMo model directory (has .nemo file or model config)
+        has_nemo_file = any(model_path.glob('*.nemo'))
+        has_config = (model_path / 'model_config.yaml').exists()
+        
+        if not (has_nemo_file or has_config):
+            LOG_MSG.debug("model path doesn't contain NeMo model files (%s)", model_path)
+            return None
+
+        if not os.access(model_path, os.R_OK):
+            LOG_MSG.debug("access rights are wrong (%s)", model_path)
+            return None
+
+        if self.path_available(str(model_path)):
+            LOG_MSG.debug("model directory already in list (%s)", model_path)
+            return None
+
+        locale_str = "multilingual"  # Parakeet models are multilingual
+        model_type = None
+        model_name = model_path.name
+
+        if model_path.parent not in MODEL_DIRS:
+            model_desc = STTParakeetModelDescription()
+            model_desc.paths = [str(model_path)]
+            model_desc.name = model_name
+            model_desc.custom = True
+            model_desc.locale = locale_str
+            model_desc.type = model_type
+
+            self._models_dict[str(model_path)] = model_desc
+            self._model_paths_dict[str(model_path)] = model_desc
+
+            LOG_MSG.debug("custom model directory is valid (%s)", model_path)
+            return model_desc
+
+        model_desc = self._models_dict.get(model_name, None)
+        if model_desc is None:
+            model_desc = STTParakeetModelDescription()
+            model_desc.paths = [str(model_path)]
+            model_desc.locale = locale_str
+            model_desc.type = model_type
+            model_desc.name = model_name
+
+            self._add_model_description_to_locale(model_desc)
+            self._models_dict[model_desc.name] = model_desc
+            self._model_paths_dict[str(model_path)] = model_desc
+
+            LOG_MSG.debug("model directory is valid (%s) - name not known yet", model_path)
+            self.emit("added", model_name, str(model_path))
+            return model_desc
+
+        model_desc.paths.append(str(model_path))
+        model_desc.paths.sort(key=lambda element: MODEL_DIRS.index(Path(element).parent))
+
+        LOG_MSG.debug("model directory is valid (%s) - name already known", model_path)
+        self.emit("added", model_name, str(model_path))
+        return model_desc
+
+    def _remove_model_description(self, model_path):
+        model_desc = self._model_paths_dict.pop(model_path, None)
+        if model_desc is None:
+            return
+
+        LOG_MSG.debug("model directory removed (%s)", model_path)
+
+        model_desc.paths.remove(model_path)
+        if not any(model_desc.paths):
+            models_list = self._locales_dict.get(model_desc.locale, [])
+            if model_desc in models_list:
+                models_list.remove(model_desc)
+            if not any(models_list):
+                self._locales_dict.pop(model_desc.locale, None)
+
+            key = model_desc.name if model_desc.custom is False else model_path
+            self._models_dict.pop(key, None)
+
+        model_name = model_desc.name if model_desc.custom is False else None
+        self.emit("removed", model_name, model_path)
+
+    def _model_file_changed_cb(self, monitor, file, other_file, event_type):
+        LOG_MSG.debug("a file changed (source = %s) %s %s", self, file.get_path(), event_type)
+
+        if file.get_path() in [str(d) for d in MODEL_DIRS if d]:
+            LOG_MSG.debug("change does not concern a child of a top directory. Ignoring.")
+            return
+
+        LOG_MSG.info("a model file changed (%s) (event=%s)", file.get_path(), event_type)
+        if event_type == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            if file.get_path().endswith(DOWNLOADED_MODEL_SUFFIX):
+                LOG_MSG.debug("temporary directory ignored (%s)", file.get_path())
+                return
+
+            self._new_model_available(Path(file.get_path()))
+        elif event_type == Gio.FileMonitorEvent.DELETED:
+            self._remove_model_description(file.get_path())
+
+    def _get_available_local_models(self):
+        for directory in MODEL_DIRS:
+            LOG_MSG.debug("scanning %s for models", directory)
+
+            if directory is None:
+                continue
+
+            monitor = Gio.File.new_for_path(str(directory)).monitor(Gio.FileMonitorFlags.NONE, None)
+            monitor.connect("changed", self._model_file_changed_cb)
+            self._monitors.append(monitor)
+
+            directory_path = Path(directory)
+            if not directory_path.is_dir():
+                continue
+
+            for child in directory_path.iterdir():
+                LOG_MSG.debug("scanning directory (%s)", str(child))
+                self._new_model_available(child)
+
+    def path_available(self, model_path):
+        return model_path in self._model_paths_dict
+
+    def get_models_for_locale(self, locale_str):
+        # Parakeet models are multilingual, so return all for any locale
+        return list(self._models_dict.values())
+
+    def get_best_path_for_model(self, model_name):
+        if model_name is None:
+            return None
+
+        model = self._models_dict.get(model_name, None)
+        if model is None:
+            return None
+
+        if model.paths in [None, []]:
+            return None
+
+        return model.paths[0]
+
+    def get_model_description(self, model_name):
+        return self._models_dict.get(model_name, None)
+
+    def get_supported_locales(self):
+        return list(self._locales_dict.keys())
+
+    def _custom_model_file_changed_cb(self, monitor, file, other_file, event_type):
+        LOG_MSG.info("a custom model file changed (%s) (event=%s)", file.get_path(), event_type)
+        if event_type == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            self._new_model_available(Path(file.get_path()))
+        elif event_type == Gio.FileMonitorEvent.DELETED:
+            model = self._model_paths_dict.get(file.get_path(), None)
+            if model is None:
+                return
+
+            LOG_MSG.debug("custom model directory removed (%s)", file.get_path())
+            self._model_paths_dict.pop(file.get_path(), None)
+            self.emit("removed", None, file.get_path())
+
+    def register_custom_model_path(self, model_path_str, locale_str):
+        if Path(model_path_str).parent in MODEL_DIRS:
+            LOG_MSG.debug("registered a path in default directories (%s)", model_path_str)
+            return
+
+        monitor = self._custom_paths.get(model_path_str, None)
+        if monitor is not None:
+            monitor.refcount += 1
+            LOG_MSG.debug("custom path already registered (%s). Increasing refcount (%i).",
+                         model_path_str, monitor.refcount)
+            return
+
+        monitor = Gio.File.new_for_path(model_path_str).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        monitor.connect("changed", self._custom_model_file_changed_cb)
+        self._custom_paths[model_path_str] = monitor
+        monitor.refcount = 1
+
+        model_desc = self._new_model_available(Path(model_path_str))
+        if model_desc:
+            model_desc.locale = locale_str
+            self._add_model_description_to_locale(model_desc)
+            self.emit("added", None, model_path_str.rstrip("/"))
+
+    def unregister_custom_model_path(self, model_path_str):
+        monitor = self._custom_paths.get(model_path_str, None)
+        if monitor is None:
+            LOG_MSG.debug("trying to unregister a path not in custom model paths (%s)", model_path_str)
+            return
+
+        if monitor.refcount != 1:
+            LOG_MSG.debug("refcount of custom path not 0 yet (%s)", model_path_str)
+            monitor.refcount -= 1
+            return
+
+        self._custom_paths.pop(model_path_str, None)
+        self._remove_model_description(model_path_str)
+
+_GLOBAL_LOCAL_MANAGER = None
+
+def stt_parakeet_local_model_manager():
+    global _GLOBAL_LOCAL_MANAGER
+    if _GLOBAL_LOCAL_MANAGER is None:
+        _GLOBAL_LOCAL_MANAGER = STTParakeetLocalModelManager()
+    return _GLOBAL_LOCAL_MANAGER
+
+class STTParakeetOnlineModelManager(GObject.Object):
+    __gtype_name__ = "STTParakeetOnlineModelManager"
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "changed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+    }
+
+    def __init__(self):
+        super().__init__()
+
+        self._locales_dict = {}
+        self._online_models = {}
+
+        local_manager = stt_parakeet_local_model_manager()
+        local_manager.connect("added", self._model_path_added_cb)
+        local_manager.connect("removed", self._model_path_removed_cb)
+        self._populate_with_parakeet_models()
+
+    def _populate_with_parakeet_models(self):
+        model_sizes = {
+            'parakeet-tdt-0.6b': '~600 MB',
+            'parakeet-tdt-0.6b-v2': '~600 MB',
+            'parakeet-tdt-1.1b': '~1.1 GB',
+        }
+
+        for model_name, repo_name in PARAKEET_MODELS.items():
+            model_desc = STTParakeetModelDescription()
+            model_desc.name = repo_name
+            model_desc.url = MODEL_PRE_URL + repo_name
+            model_desc.size = model_sizes.get(model_name, 'Unknown')
+            model_desc.locale = 'multilingual'
+            model_desc.type = model_name
+
+            LOG_MSG.debug("adding online model (%s)", model_desc.name)
+
+            local_desc = stt_parakeet_local_model_manager().get_model_description(model_desc.name)
+            if local_desc is not None:
+                model_desc.paths = local_desc.paths
+
+            self._online_models[model_desc.name] = model_desc
+            self._add_model_description_to_locale(model_desc)
+
+        # Add local custom models
+        for locale in stt_parakeet_local_model_manager().get_supported_locales():
+            model_list = stt_parakeet_local_model_manager().get_models_for_locale(locale)
+            LOG_MSG.debug("adding local models for locale (%s)", locale)
+            for model_desc in model_list:
+                key = model_desc.name if model_desc.custom is False else model_desc.paths[0]
+                if key in self._online_models:
+                    continue
+
+                LOG_MSG.debug("adding local model to online dict (%s)", key)
+                self._online_models[key] = model_desc
+                self._add_model_description_to_locale(model_desc)
+
+    def _add_model_description_to_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+        if locale_models is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            locale_models.append(model_desc)
+
+    def _model_path_added_cb(self, manager, model_name, model_path):
+        if model_name is not None:
+            online_model_desc = self._online_models.get(model_name, None)
+            local_model_desc = manager.get_model_description(model_name)
+        else:
+            online_model_desc = self._online_models.get(model_path, None)
+            local_model_desc = manager.get_model_description(model_path)
+
+        if online_model_desc is not None:
+            if online_model_desc.paths in [None, []]:
+                online_model_desc.paths = local_model_desc.paths
+            self.emit("changed", online_model_desc)
+            return
+
+        key = local_model_desc.name if local_model_desc.custom is False else local_model_desc.paths[0]
+        self._online_models[key] = local_model_desc
+        self._add_model_description_to_locale(local_model_desc)
+        self.emit("added", local_model_desc)
+
+    def _remove_model_description_from_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+        if locale_models and model_desc in locale_models:
+            locale_models.remove(model_desc)
+        if not any(locale_models):
+            self._locales_dict.pop(model_desc.locale, None)
+
+    def _model_path_removed_cb(self, manager, model_name, model_path):
+        if model_name is None:
+            online_model_desc = self._online_models.pop(model_path, None)
+            if online_model_desc:
+                self._remove_model_description_from_locale(online_model_desc)
+                self.emit("removed", online_model_desc)
+            return
+
+        online_model_desc = self._online_models.get(model_name, None)
+        if online_model_desc is None:
+            return
+
+        if any(online_model_desc.paths):
+            self.emit("changed", online_model_desc)
+            return
+
+        if online_model_desc.url is not None:
+            self.emit("changed", online_model_desc)
+            return
+
+        self._online_models.pop(model_name, None)
+        self._remove_model_description_from_locale(online_model_desc)
+        self.emit("removed", online_model_desc)
+
+    def get_model_description(self, model_name):
+        return self._online_models.get(model_name, None)
+
+    def get_models_for_locale(self, locale_str):
+        # Parakeet is multilingual, return all models for any locale
+        all_models = []
+        for models in self._locales_dict.values():
+            all_models.extend(models)
+        return all_models
+
+    def supported_locales(self):
+        return list(self._locales_dict.keys())
+
+_GLOBAL_ONLINE_MANAGER = None
+
+def stt_parakeet_online_model_manager():
+    global _GLOBAL_ONLINE_MANAGER
+    if _GLOBAL_ONLINE_MANAGER is None:
+        _GLOBAL_ONLINE_MANAGER = STTParakeetOnlineModelManager()
+    return _GLOBAL_ONLINE_MANAGER
+
+
+
+5. Update engine/sttconfigdialog.ui
+
+<object class="GtkStringList" id="backend_list">
+  <items>
+    <item translatable="yes">Vosk</item>
+    <item translatable="yes">Whisper</item>
+    <item translatable="yes">Parakeet</item>
+  </items>
+</object>
+
+
+
+
+6. Update engine/sttconfigdialog.py
+
+# Add import at top
+from sttparakeetmodelmanagers import stt_parakeet_online_model_manager
+
+# In __init__ method, update backend initialization
+backend = self._settings.get_string("backend")
+if backend == "parakeet":
+    self.backend_dropdown.set_selected(2)
+elif backend == "whisper":
+    self.backend_dropdown.set_selected(1)
+else:
+    self.backend_dropdown.set_selected(0)
+
+# Update backend_dropdown_selected_cb
+@Gtk.Template.Callback()
+def backend_dropdown_selected_cb(self, dropdown, param):
+    selected = dropdown.get_selected()
+    if selected == 0:
+        backend = "vosk"
+    elif selected == 1:
+        backend = "whisper"
+    else:
+        backend = "parakeet"
+    
+    current_backend = self._settings.get_string("backend")
+    if backend != current_backend:
+        self._settings.set_string("backend", backend)
+        self._reload_locale_rows()
+
+# Add initialization in __init__
+stt_parakeet_online_model_manager()
+
+
+
+
+7. Update engine/sttlocalerow.py
+
+# Add import
+from sttparakeetmodel import STTParakeetModel
+from sttparakeetmodelmanagers import stt_parakeet_online_model_manager
+
+# Update _init_model method
+def _init_model(self):
+    backend = self._settings.get_string("backend")
+    if backend == "parakeet":
+        self._model = STTParakeetModel(locale_str=self._locale)
+    elif backend == "whisper":
+        self._model = STTWhisperModel(locale_str=self._locale)
+    else:
+        self._model = STTVoskModel(locale_str=self._locale)
+    
+    self._model.connect("changed", self._model_changed)
+    self.update_description()
+
+# Update update_description method
+def update_description(self):
+    if self._model.available() == False:
+        self.set_subtitle(_("No model downloaded yet"))
+        return
+
+    model_name = self._model.get_name()
+    if model_name in [None, ""]:
+        model_path = self._model.get_path()
+        if model_path and model_path != "":
+            self.set_subtitle(_("Custom model: %s") % model_path)
+        else:
+            self.set_subtitle(_("Custom model installed manually in a non-standard directory"))
+        return
+
+    backend = self._settings.get_string("backend")
+    if backend == "parakeet":
+        manager = stt_parakeet_online_model_manager()
+    elif backend == "whisper":
+        manager = stt_whisper_online_model_manager()
+    else:
+        manager = stt_vosk_online_model_manager()
+    
+    model = manager.get_model_description(model_name)
+    # ... rest of the method
+
+
+
+8. Update engine/sttmodelchooserdialog.py
+
+# Add imports
+from sttparakeetmodelmanagers import stt_parakeet_online_model_manager
+from sttparakeetmodel import STTParakeetModel
+
+# Update __init__ to detect Parakeet
+self._is_parakeet = isinstance(model, STTParakeetModel)
+if self._is_parakeet:
+    self._manager = stt_parakeet_online_model_manager()
+elif self._is_whisper:
+    self._manager = stt_whisper_online_model_manager()
+else:
+    self._manager = stt_vosk_online_model_manager()
+
+# Update dialog title
+if self._is_parakeet:
+    backend_name = "Parakeet"
+elif self._is_whisper:
+    backend_name = "Whisper"
+else:
+    backend_name = "Vosk"
+self.set_title(_("Manage %s Recognition Models") % backend_name)
+
+# Update file chooser logic
+if self._is_parakeet:
+    action = Gtk.FileChooserAction.SELECT_FOLDER
+    title = _("Open Parakeet Model Folder")
+elif self._is_whisper:
+    action = Gtk.FileChooserAction.OPEN
+    title = _("Open Whisper Model File")
+else:
+    action = Gtk.FileChooserAction.SELECT_FOLDER
+    title = _("Open Vosk Model Folder")
+
+
+
+
+
+
+9. Update data/org.freedesktop.ibus.engine.stt.gschema.xml.in
+
+<!-- Add after whisper-models key -->
+<key type="s" name="parakeet-models">
+  <summary>Paths to Parakeet models</summary>
+  <default>'None'</default>
+  <description>A JSON formatted string that is used to associate locales with their Parakeet models. It can be the name of a model if it is in default monitored paths or a custom path.</description>
+</key>
+
+
+
+
+
+10. Update engine/meson.build
+
+stt_sources = [
+    'main.py',
+    'mainconfig.py',
+    'sttenginefactory.py',
+    'sttengine.py',
+    'sttgstvosk.py',
+    'sttgstwhisper.py',
+    'sttgstparakeet.py',  # Add this
+    'sttgstfactory.py',
+    'sttgstbase.py',
+    'sttsegmentprocess.py',
+    'sttconfigdialog.py',
+    'sttlocalerow.py',
+    'sttvoskmodel.py',
+    'sttwhispermodel.py',
+    'sttparakeetmodel.py',  # Add this
+    'sttcurrentlocale.py',
+    'sttutterancetree.py',
+    'sttshortcutrow.py',
+    'sttshortcutdialog.py',
+    'sttutterancerow.py',
+    'sttmodelchooserdialog.py',
+    'sttvoskmodelmanagers.py',
+    'sttwhispermodelmanagers.py',
+    'sttparakeetmodelmanagers.py',  # Add this
+    'sttwordstodigits.py',
+    'sttmodelrow.py'
+]
+
+
+
+
+
+
