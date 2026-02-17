@@ -2183,3 +2183,85 @@ def stt_gst_factory_default():
 
 
 
+
+
+
+
+
+import logging
+import weakref
+
+from gi.repository import GObject
+from gi.repository import Gio
+
+from sttutils import *
+
+from sttgstvosk import STTGstVosk
+from sttgstwhisper import STTGstWhisper
+# NOTE: STTGstParakeet is intentionally NOT imported here at module level.
+# nemo_toolkit pulls in onnx/protobuf and takes several seconds to load.
+# We import it lazily only when the user has actually selected the Parakeet backend.
+
+LOG_MSG=logging.getLogger()
+
+class STTGstFactory(GObject.GObject):
+    __gtype_name__ = "STTGstFactory"
+
+    def __init__(self):
+        super().__init__()
+
+        self._current_engine=None
+        self._preload=None
+
+        self.__settings=Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self.__settings.connect("changed::preload", self.__preload_changed)
+        self.__update_preloaded_engine()
+
+    def new_engine(self):
+        engine=None if self._current_engine is None else self._current_engine()
+        if engine is None:
+            LOG_MSG.debug("new engine")
+            backend = self.__settings.get_string("backend")
+            if backend == "parakeet":
+                LOG_MSG.info("Using Parakeet backend")
+                # Lazy import: only pay the nemo/onnx startup cost when needed
+                from sttgstparakeet import STTGstParakeet
+                engine=STTGstParakeet()
+            elif backend == "whisper":
+                LOG_MSG.info("Using Whisper backend")
+                engine=STTGstWhisper()
+            else:
+                LOG_MSG.info("Using Vosk backend")
+                engine=STTGstVosk()
+            self._current_engine=weakref.ref(engine)
+        else:
+            engine.hold()
+
+        return engine
+
+    def __update_preloaded_engine(self):
+        preload=self.__settings.get_boolean("preload")
+        if preload == (self._preload is not None):
+            return
+
+        if preload is True:
+            self._preload=self.new_engine()
+            LOG_MSG.info("preloading engine")
+            self._preload.preload()
+        else:
+            LOG_MSG.info("unloading engine")
+            self._preload.release()
+            self._preload=None
+
+    def __preload_changed(self, settings, key):
+        self.__update_preloaded_engine()
+
+_GLOBAL_FACTORY = None
+
+def stt_gst_factory_default():
+    global _GLOBAL_FACTORY
+
+    if _GLOBAL_FACTORY == None:
+        _GLOBAL_FACTORY = STTGstFactory()
+
+    return _GLOBAL_FACTORY
