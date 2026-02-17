@@ -1,3 +1,45 @@
+def _load_whisper_model(self, model_path):
+    if not WHISPER_AVAILABLE:
+        LOG_MSG.error("pywhispercpp not available")
+        return False
+
+    try:
+        lang_code = "en"
+        if self._current_locale and self._current_locale.locale:
+            lang_code = self._current_locale.locale[:2]
+
+        LOG_MSG.info("Loading Whisper model: %s (language=%s)", model_path, lang_code)
+
+        self._whisper = Model(
+            model_path,
+            language=lang_code,   # 🔴 ALWAYS FORCE
+            n_threads=2,
+            translate=False,
+            print_realtime=False,
+            print_progress=False,
+        )
+
+        LOG_MSG.info("Whisper model loaded successfully")
+        return True
+
+    except Exception as e:
+        LOG_MSG.error("Failed to load Whisper model: %s", e)
+        self._whisper = None
+        return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 parakit
 
 
