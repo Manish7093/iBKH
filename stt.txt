@@ -1,4 +1,27 @@
 def _load_whisper_model(self, model_path):
+    lang_code = None
+    if self._current_locale and self._current_locale.locale:
+        locale = self._current_locale.locale
+        if locale not in ('multilingual', '', None):
+            lang_code = locale[:2].lower()
+    
+    params = dict(print_realtime=False, print_progress=False)
+    if lang_code:
+        params['language'] = lang_code
+    
+    self._whisper = Model(model_path, **params)
+
+
+
+
+
+
+
+
+
+
+
+def _load_whisper_model(self, model_path):
     if not WHISPER_AVAILABLE:
         LOG_MSG.error("pywhispercpp not available")
         return False
