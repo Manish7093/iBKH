@@ -1,3 +1,94 @@
+--- a/gettext.spec
++++ b/gettext.spec
+@@ -7,8 +7,8 @@
+ 
+ Summary: GNU tools and libraries for localized translated messages
+ Name: gettext
+-Version: 0.26
+-Release: 4%{?dist}
++Version: 1.0
++Release: 1%{?dist}
+ 
+ # The following are licensed under LGPLv2+:
+ # - libintl and its headers
+@@ -29,9 +29,9 @@ Source: https://ftp.gnu.org/pub/gnu/%{name}/%{name}-%{version}.tar.gz
+ Source2: msghack.py
+ Source3: msghack.1
+ 
+-Patch1: gettext-0.21.1-covscan.patch
+-Patch2: gettext-0.26-c23.diff
+-Patch3: gettext-0.26-stdcountof-h.patch
++#Patch1: gettext-0.21.1-covscan.patch
++#Patch2: gettext-0.26-c23.diff
++#Patch3: gettext-0.26-stdcountof-h.patch
+ # for bootstrapping
+ # BuildRequires: autoconf >= 2.62
+ BuildRequires: automake
+@@ -197,9 +197,9 @@ Substitutes the values of environment variables.
+ 
+ %prep
+ %setup -q
+-%patch 1 -p1 -b .orig~
+-%patch 2 -p1 -b .orig~
+-%patch 3 -p1 -b .orig~
++#%patch 1 -p1 -b .orig~
++#%patch 2 -p1 -b .orig~
++#%patch 3 -p1 -b .orig~
+ autoreconf
+ 
+ # Defeat libtextstyle attempt to bundle libxml2.  The comments
+@@ -340,6 +340,9 @@ make check LIBUNISTRING=-lunistring
+ %{_bindir}/msgmerge
+ %{_bindir}/msgunfmt
+ %{_bindir}/msguniq
++%{_bindir}/msgpre
++%{_bindir}/po-fetch
++%{_bindir}/spit
+ %{_bindir}/recode-sr-latin
+ %{_bindir}/xgettext
+ %{_infodir}/gettext*
+@@ -430,8 +433,8 @@ make check LIBUNISTRING=-lunistring
+@@ -430,8 +433,8 @@ make check LIBUNISTRING=-lunistring
+ %files libs
+ %{_libdir}/libasprintf.so.0*
+ %{_libdir}/libgettextpo.so.0*
+-%{_libdir}/libgettextlib-0.*.so
+-%{_libdir}/libgettextsrc-0.*.so
++%{_libdir}/libgettextlib-1.*.so
++%{_libdir}/libgettextsrc-1.*.so
+ %if %{with jar}
+ %{_datadir}/%{name}/libintl.jar
+ %endif
+@@ -458,7 +461,10 @@ make check LIBUNISTRING=-lunistring
+ %{_mandir}/man1/msghack.1*
+ 
+ %changelog
+-* Fri Jan 16 2026 Fedora Release Engineering <releng@fedoraproject.org> - 0.26-4
++* Mon Jan 19 2026 Manish Tiwari <matiwari@redhat.com> - 1.0-1
++- update to 1.0 release* 
++
++Fri Jan 16 2026 Fedora Release Engineering <releng@fedoraproject.org> - 0.26-4
+ - Rebuilt for https://fedoraproject.org/wiki/Fedora_44_Mass_Rebuild
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import logging
 import threading
 import queue
