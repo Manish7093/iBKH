@@ -1,3 +1,169 @@
+gettext]$ diff -rq gettext-0.26 gettext-1.0/ | grep "Only in"
+Only in gettext-0.26/gettext-runtime/gnulib-lib: iconv_open-irix.gperf
+Only in gettext-0.26/gettext-runtime/gnulib-lib: iconv_open-irix.h
+Only in gettext-0.26/gettext-runtime/gnulib-lib: iconv_open-osf.gperf
+Only in gettext-0.26/gettext-runtime/gnulib-lib: iconv_open-osf.h
+Only in gettext-1.0/gettext-runtime/gnulib-lib: isinf.c
+Only in gettext-1.0/gettext-runtime/gnulib-lib: stdio-consolesafe.c
+Only in gettext-1.0/gettext-runtime/gnulib-lib: string.c
+Only in gettext-1.0/gettext-runtime/gnulib-lib: strncpy.c
+Only in gettext-1.0/gettext-runtime/gnulib-m4: check-math-lib.m4
+Only in gettext-1.0/gettext-runtime/gnulib-m4: gettext_h.m4
+Only in gettext-1.0/gettext-runtime/gnulib-m4: isinf.m4
+Only in gettext-1.0/gettext-runtime/gnulib-m4: libdl.m4
+Only in gettext-1.0/gettext-runtime/gnulib-m4: stringeq.m4
+Only in gettext-1.0/gettext-runtime/gnulib-m4: strncpy.m4
+Only in gettext-1.0/gettext-runtime/install-tests: itest.pot
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: fseterr.c
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: fseterr.h
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: intprops-internal.h
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: stdckdint.in.h
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: stdio-consolesafe.c
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: stdio-impl.h
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: string.c
+Only in gettext-1.0/gettext-runtime/intl/gnulib-lib: strncpy.c
+Only in gettext-1.0/gettext-runtime/intl/gnulib-m4: fseterr.m4
+Only in gettext-1.0/gettext-runtime/intl/gnulib-m4: stdckdint_h.m4
+Only in gettext-1.0/gettext-runtime/intl/gnulib-m4: stringeq.m4
+Only in gettext-1.0/gettext-runtime/intl/gnulib-m4: strncpy.m4
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: fseterr.c
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: fseterr.h
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: intprops-internal.h
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: stdckdint.in.h
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: stdio-consolesafe.c
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: stdio-impl.h
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-lib: string.c
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-m4: fseterr.m4
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-m4: stdckdint_h.m4
+Only in gettext-1.0/gettext-runtime/libasprintf/gnulib-m4: stringeq.m4
+Only in gettext-0.26/gettext-runtime/po: en@boldquot.gmo
+Only in gettext-0.26/gettext-runtime/po: en@boldquot.po
+Only in gettext-0.26/gettext-runtime/po: en@quot.gmo
+Only in gettext-0.26/gettext-runtime/po: en@quot.po
+Only in gettext-1.0/gettext-runtime/po: fetch-po
+Only in gettext-1.0/gettext-tools: autotools
+Only in gettext-1.0/gettext-tools/build-aux: tree-sitter-d-optimization-bug.diff
+Only in gettext-1.0/gettext-tools/build-aux: tree-sitter-ocaml-portability.diff
+Only in gettext-1.0/gettext-tools/doc: gettext_32.html
+Only in gettext-1.0/gettext-tools/doc: lang-ocaml.texi
+Only in gettext-1.0/gettext-tools/doc: msgpre.texi
+Only in gettext-1.0/gettext-tools/doc: po-fetch.texi
+Only in gettext-1.0/gettext-tools/doc: spit.texi
+Only in gettext-1.0/gettext-tools/examples: hello-ocaml
+Only in gettext-1.0/gettext-tools/examples/po: fetch-po
+Only in gettext-1.0/gettext-tools/examples/po: hello-ocaml.pot
+Only in gettext-1.0/gettext-tools/gnulib-lib: fseterr.c
+Only in gettext-1.0/gettext-tools/gnulib-lib: fseterr.h
+Only in gettext-0.26/gettext-tools/gnulib-lib: iconv_open-irix.gperf
+Only in gettext-0.26/gettext-tools/gnulib-lib: iconv_open-irix.h
+Only in gettext-0.26/gettext-tools/gnulib-lib: iconv_open-osf.gperf
+Only in gettext-0.26/gettext-tools/gnulib-lib: iconv_open-osf.h
+Only in gettext-1.0/gettext-tools/gnulib-lib: issymlink.c
+Only in gettext-1.0/gettext-tools/gnulib-lib: issymlink.h
+Only in gettext-1.0/gettext-tools/gnulib-lib: stdio-consolesafe.c
+Only in gettext-1.0/gettext-tools/gnulib-lib: string.c
+Only in gettext-1.0/gettext-tools/gnulib-lib: strncpy.c
+Only in gettext-1.0/gettext-tools/gnulib-m4: fseterr.m4
+Only in gettext-1.0/gettext-tools/gnulib-m4: gettext_h.m4
+Only in gettext-1.0/gettext-tools/gnulib-m4: libdl.m4
+Only in gettext-1.0/gettext-tools/gnulib-m4: stringeq.m4
+Only in gettext-1.0/gettext-tools/gnulib-m4: strncpy.m4
+Only in gettext-1.0/gettext-tools/gnulib-tests: test-fseterr.c
+Only in gettext-1.0/gettext-tools/gnulib-tests: test-posix_spawnp-vfork.c
+Only in gettext-1.0/gettext-tools/gnulib-tests: test-strncpy.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/unicase: test-unicase-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/uniconv: test-uniconv-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/unictype: test-unictype-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/unilbrk: test-unilbrk-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/uniname: test-uniname-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/uninorm: test-uninorm-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests/unistr: test-unistr-h.c
+Only in gettext-1.0/gettext-tools/gnulib-tests: uniwidth
+Only in gettext-1.0/gettext-tools/libgettextpo: fseterr.c
+Only in gettext-1.0/gettext-tools/libgettextpo: fseterr.h
+Only in gettext-0.26/gettext-tools/libgettextpo: iconv_open-irix.gperf
+Only in gettext-0.26/gettext-tools/libgettextpo: iconv_open-irix.h
+Only in gettext-0.26/gettext-tools/libgettextpo: iconv_open-osf.gperf
+Only in gettext-0.26/gettext-tools/libgettextpo: iconv_open-osf.h
+Only in gettext-1.0/gettext-tools/libgettextpo: stdio-consolesafe.c
+Only in gettext-1.0/gettext-tools/libgettextpo: stdio-impl.h
+Only in gettext-1.0/gettext-tools/libgettextpo: string.c
+Only in gettext-1.0/gettext-tools/libgrep/gnulib-lib: string.c
+Only in gettext-1.0/gettext-tools/libgrep/gnulib-lib: strncpy.c
+Only in gettext-1.0/gettext-tools/man: msgpre.1
+Only in gettext-1.0/gettext-tools/man: msgpre.1.html
+Only in gettext-1.0/gettext-tools/man: msgpre.x
+Only in gettext-1.0/gettext-tools/man: po-fetch.1
+Only in gettext-1.0/gettext-tools/man: po-fetch.1.diff
+Only in gettext-1.0/gettext-tools/man: po-fetch.1.html
+Only in gettext-1.0/gettext-tools/man: po-fetch.x
+Only in gettext-1.0/gettext-tools/man: spit.1
+Only in gettext-1.0/gettext-tools/man: spit.1.html
+Only in gettext-1.0/gettext-tools/man: spit.x
+Only in gettext-0.26/gettext-tools/misc: add-to-archive
+Only in gettext-0.26/gettext-tools/misc: archive.dir.tar
+Only in gettext-0.26/gettext-tools/misc: autopoint.in
+Only in gettext-0.26/gettext-tools/misc: convert-archive.in
+Only in gettext-0.26/gettext-tools/misc: cvsuser.c
+Only in gettext-0.26/gettext-tools/misc: gettextize.in
+Only in gettext-1.0/gettext-tools/misc: po-fetch.in
+Only in gettext-0.26/gettext-tools/po: en@boldquot.gmo
+Only in gettext-0.26/gettext-tools/po: en@boldquot.po
+Only in gettext-0.26/gettext-tools/po: en@quot.gmo
+Only in gettext-0.26/gettext-tools/po: en@quot.po
+Only in gettext-1.0/gettext-tools/po: fetch-po
+Only in gettext-0.26/gettext-tools/po: Makevars.template
+Only in gettext-1.0/gettext-tools/src: country-table.c
+Only in gettext-1.0/gettext-tools/src: country-table.h
+Only in gettext-1.0/gettext-tools/src: format-ocaml.c
+Only in gettext-1.0/gettext-tools/src: msgl-merge.c
+Only in gettext-1.0/gettext-tools/src: msgl-merge.h
+Only in gettext-1.0/gettext-tools/src: msgpre.c
+Only in gettext-1.0/gettext-tools/src: spit.c
+Only in gettext-1.0/gettext-tools/src: spit.py.in
+Only in gettext-1.0/gettext-tools/src: x-ocaml.c
+Only in gettext-1.0/gettext-tools/src: x-ocaml.h
+Only in gettext-1.0/gettext-tools/tests: format-ocaml-1
+Only in gettext-1.0/gettext-tools/tests: format-ocaml-2
+Only in gettext-1.0/gettext-tools/tests/gnulib-lib: string.c
+Only in gettext-1.0/gettext-tools/tests: lang-ocaml
+Only in gettext-1.0/gettext-tools/tests: xgettext-ocaml-1
+Only in gettext-1.0/gettext-tools/tests: xgettext-ocaml-2
+Only in gettext-1.0/gettext-tools: tree-sitter-ocaml-0.23.2
+Only in gettext-1.0/gettext-tools: wizard
+Only in gettext-1.0/libtextstyle/gnulib-m4: fseterr.m4
+Only in gettext-1.0/libtextstyle/gnulib-m4: gettext_h.m4
+Only in gettext-1.0/libtextstyle/gnulib-m4: stringeq.m4
+Only in gettext-1.0/libtextstyle/gnulib-m4: strncpy.m4
+Only in gettext-1.0/libtextstyle/lib: fseterr.c
+Only in gettext-1.0/libtextstyle/lib: fseterr.h
+Only in gettext-0.26/libtextstyle/lib: stdbool.mini.h
+Only in gettext-1.0/libtextstyle/lib: stdio-consolesafe.c
+Only in gettext-1.0/libtextstyle/lib: stdio-impl.h
+Only in gettext-1.0/libtextstyle/lib: string.c
+Only in gettext-1.0/libtextstyle/lib: strncpy.c
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- a/gettext.spec
 +++ b/gettext.spec
 @@ -7,8 +7,8 @@
