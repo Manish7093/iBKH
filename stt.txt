@@ -1,3 +1,38 @@
+    if backend == "whisper":
+        if model is None:
+            self.set_subtitle(_("Unknown Whisper model"))
+        else:
+            model_type = (model.type or "").capitalize()
+            size       = model.size or _("unknown size")
+            if model.locale == "en":
+                self.set_subtitle(_("%s – English only – %s") % (model_type, size))
+            elif model.locale == "multilingual":
+                self.set_subtitle(_("%s – Multilingual – %s") % (model_type, size))
+            else:
+                self.set_subtitle(_("%s – %s") % (model_type, size))
+        return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
   <requires lib="gtk" version="4.0"/>
