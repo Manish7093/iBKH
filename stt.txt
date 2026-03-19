@@ -1,4 +1,37 @@
-    if backend == "whisper":
++    @property
++    def description(self):
++        """Return a human-readable description matching what STTModelRow expects."""
++        model_type = (self.type or "").capitalize()
++        size       = self.size or "unknown size"
++
++        if self.locale == "en":
++            lang = "English only"
++        elif self.locale == "multilingual":
++            lang = "Multilingual"
++        else:
++            lang = self.locale or "unknown language"
++
++        return "%s – %s – %s" % (model_type, lang, size)
++
++    @description.setter
++    def description(self, value):
++        # Absorb any write from STTModelRow/Vosk-shared code paths gracefully
++        pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+f backend == "whisper":
         if model is None:
             self.set_subtitle(_("Unknown Whisper model"))
         else:
