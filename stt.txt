@@ -1,3 +1,32 @@
++        elif isinstance(self._desc, STTWhisperModelDescription):
++            model_type = (self._desc.type or "").lower()
++            if model_type in ("large-v1", "large-v2", "large-v3"):
++                quality = _("Most accurate, slower and resource-heavy")
++            elif model_type in ("medium", "medium.en"):
++                quality = _("High accuracy, moderate speed")
++            elif model_type in ("small", "small.en"):
++                quality = _("Good balance of speed and accuracy")
++            elif model_type in ("base", "base.en"):
++                quality = _("Fast and lightweight")
++            elif model_type in ("tiny", "tiny.en"):
++                quality = _("Fastest, lowest accuracy")
++            else:
++                quality = _("Whisper model")
++
++            lang = _("English only") if (self._desc.locale == "en") else _("Multilingual")
++            description = _("%s \u2013 %s \u2013 %s") % (quality, lang, size)
+
+
+
+
+
+
+
+
+
+
+
+
 +    @property
 +    def description(self):
 +        """Return a human-readable description matching what STTModelRow expects."""
