@@ -1,3 +1,6 @@
++from sttwhispermodelmanagers import STTDownloadState as WhisperDownloadState, STTWhisperModelDescription
+ 
+
 +        elif isinstance(self._desc, STTWhisperModelDescription):
 +            model_type = (self._desc.type or "").lower()
 +            if model_type in ("large-v1", "large-v2", "large-v3"):
