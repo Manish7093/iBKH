@@ -1,3 +1,55 @@
+diff --git a/engine/sttmodelrow.py b/engine/sttmodelrow.py
+--- a/engine/sttmodelrow.py
++++ b/engine/sttmodelrow.py
+@@ -from update_description -@
+         elif isinstance(self._desc, STTWhisperModelDescription):
+             model_type = (self._desc.type or "").lower()
++
++            # Strip quantization suffix (e.g. "-q5_1", "-q5_0", "-q4_0" …)
++            # so the quality lookup works for both full and quantized variants
++            from sttwhispermodelmanagers import QUANTIZATION_TYPES
++            quant_label = None
++            for qt in QUANTIZATION_TYPES:
++                if model_type.endswith("-" + qt):
++                    quant_label = qt.upper()          # e.g. "Q5_1"
++                    model_type  = model_type[: -(len(qt) + 1)]
++                    break
++
+-            if model_type in ("large-v1", "large-v2", "large-v3"):
++            if model_type in ("large-v1", "large-v2", "large-v3",
++                              "large-v3-turbo"):
+                 quality = _("Most accurate, slower and resource-heavy")
+             elif model_type in ("medium", "medium.en"):
+                 quality = _("High accuracy, moderate speed")
+             elif model_type in ("small", "small.en"):
+                 quality = _("Good balance of speed and accuracy")
+             elif model_type in ("base", "base.en"):
+                 quality = _("Fast and lightweight")
+             elif model_type in ("tiny", "tiny.en"):
+                 quality = _("Fastest, lowest accuracy")
+             else:
+                 quality = _("Whisper model")
+ 
++            if quant_label is not None:
++                quality = _("%s (Quantized %s, smaller & faster)") % (quality, quant_label)
++
+             lang = _("English only") if (self._desc.locale == "en") else _("Multilingual")
+             description = _("%s \u2013 %s \u2013 %s") % (quality, lang, size)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 +from sttwhispermodelmanagers import STTDownloadState as WhisperDownloadState, STTWhisperModelDescription
  
 
