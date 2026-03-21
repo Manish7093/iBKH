@@ -1,3 +1,1617 @@
+sttconfigdialog.py file 
+
+import logging
+import locale
+
+from gettext import gettext as _
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+from gi.repository import Gtk, Gio, Adw
+
+from sttutils import *
+from sttlocalerow import STTLocaleRow
+from sttshortcutrow import STTShortcutRow
+from sttshortcutdialog import STTShortcutDialog
+
+from sttcurrentlocale import stt_current_locale
+from sttvoskmodelmanagers import stt_vosk_online_model_manager
+from sttwhispermodelmanagers import stt_whisper_online_model_manager
+
+from sttgstvosk import STTGstVosk
+
+LOG_MSG = logging.getLogger()
+
+
+@Gtk.Template(resource_path="/org/freedesktop/ibus/engine/stt/config/sttconfigdialog.ui")
+class STTConfigDialog(Adw.Window):          # ← was Adw.PreferencesWindow
+    __gtype_name__ = "STTConfigDialog"
+
+    # ── Toast overlay (replaces Adw.PreferencesWindow.add_toast) ──────────
+    toast_overlay = Gtk.Template.Child()
+
+    # ── Sidebar navigation ─────────────────────────────────────────────────
+    nav_listbox      = Gtk.Template.Child()
+    nav_row_general  = Gtk.Template.Child()
+    nav_row_locales  = Gtk.Template.Child()
+    nav_row_shortcuts = Gtk.Template.Child()
+
+    # ── Page header widgets ────────────────────────────────────────────────
+    page_title_label = Gtk.Template.Child()
+    cancel_button    = Gtk.Template.Child()
+    status_label     = Gtk.Template.Child()
+    status_icon      = Gtk.Template.Child()
+
+    # ── Main content stack + pages ─────────────────────────────────────────
+    main_stack    = Gtk.Template.Child()
+    page_general  = Gtk.Template.Child()
+    page_locales  = Gtk.Template.Child()
+    page_shortcuts = Gtk.Template.Child()
+    page_category  = Gtk.Template.Child()
+
+    # ── Backend selection cards ────────────────────────────────────────────
+    backend_vosk_button    = Gtk.Template.Child()
+    backend_whisper_button = Gtk.Template.Child()
+
+    # ── Behaviour switches ─────────────────────────────────────────────────
+    default_locale_switch  = Gtk.Template.Child()
+    preload_model_switch   = Gtk.Template.Child()
+    active_on_start_switch = Gtk.Template.Child()
+
+    # ── Locale list ────────────────────────────────────────────────────────
+    localelistbox = Gtk.Template.Child()
+
+    # ── Shortcut category rows ─────────────────────────────────────────────
+    commands_row   = Gtk.Template.Child()
+    case_row       = Gtk.Template.Child()
+    diacritics_row = Gtk.Template.Child()
+    punctuation_row = Gtk.Template.Child()
+
+    # ── Shortcut list-boxes ────────────────────────────────────────────────
+    commandslistbox   = Gtk.Template.Child()
+    caselistbox       = Gtk.Template.Child()
+    diacriticslistbox = Gtk.Template.Child()
+    punctuationlistbox = Gtk.Template.Child()
+    customlistbox      = Gtk.Template.Child()
+
+    # ── Category detail stack + sub-pages ─────────────────────────────────
+    category_stack  = Gtk.Template.Child()
+    commandspage    = Gtk.Template.Child()
+    casepage        = Gtk.Template.Child()
+    diacriticspage  = Gtk.Template.Child()
+    punctuationpage = Gtk.Template.Child()
+    custompage      = Gtk.Template.Child()
+
+    # ──────────────────────────────────────────────────────────────────────
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._valid_formatting_file_path = False
+        self._valid_formatting_file = False
+        self._valid_override_file = False
+
+        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._settings.bind("preload", self.preload_model_switch, "active",
+                            Gio.SettingsBindFlags.DEFAULT)
+        self._settings.bind("active-on-start", self.active_on_start_switch, "active",
+                            Gio.SettingsBindFlags.DEFAULT)
+
+        # Backend setting → card highlight
+        self._backend_changed_id = self._settings.connect(
+            "changed::backend", self._backend_changed_cb)
+        backend = self._settings.get_string("backend")
+        self._set_backend_ui(0 if backend == "vosk" else 1)
+
+        self._locales = {}
+        self._values_dict = {}
+        self._utterances_dict = {}
+        self._no_model_toast = None
+        self._unsupported_locale_toast = None
+
+        stt_vosk_online_model_manager()
+        stt_whisper_online_model_manager()
+
+        self._current_locale = stt_current_locale()
+        self._locale_sig_id = self._current_locale.connect(
+            "changed", self._locale_changed_cb)
+        self._override_file_changed_id = self._current_locale.connect(
+            "override-file-changed", self._override_file_changed_cb)
+        self._override_file_written = False
+
+        system_locale = locale.getlocale()[0]
+        self._add_locale_row(system_locale)
+
+        if system_locale != self._current_locale.locale:
+            self._add_locale_row(self._current_locale.locale)
+
+        supported_locales = stt_vosk_online_model_manager().supported_locales()
+        supported_locales.sort()
+        for locale_str in supported_locales:
+            if locale_str in [self._current_locale.locale, system_locale]:
+                continue
+            LOG_MSG.debug("loading %s", locale_str)
+            self._add_locale_row(locale_str)
+
+        self._load_utterances()
+
+        self._engine = STTGstVosk(current_locale=self._current_locale)
+        self._engine.connect("model-changed", self._engine_model_changed_cb)
+        self._engine.preload()
+
+        LOG_MSG.debug("model exists %s", self._engine.has_model())
+
+        if self.default_locale_switch.get_active() != self._current_locale.default_locale:
+            self.default_locale_switch.set_active(self._current_locale.default_locale)
+
+        self._set_locale_rows_sensitivity()
+
+        if not self._engine.has_model():
+            self._engine_has_no_model()
+
+        if not self._valid_formatting_file:
+            self._unsupported_locale()
+
+        # Toast action (same as before, but group attached to self not a subpage)
+        self._toast_action = Gio.SimpleAction.new("manage_model", None)
+        action_group = Gio.SimpleActionGroup.new()
+        action_group.insert(self._toast_action)
+        self.insert_action_group("toast", action_group)
+        self._toast_action.connect("activate", self._manage_model_action_activated)
+
+        # ── Wire up sidebar navigation ─────────────────────────────────────
+        # Build the map after all template children are initialised.
+        self._nav_map = {
+            self.nav_row_general:   (self.page_general,   _("General")),
+            self.nav_row_locales:   (self.page_locales,   _("Locales")),
+            self.nav_row_shortcuts: (self.page_shortcuts,  _("Shortcuts")),
+        }
+        # Select General on open (triggers nav_row_selected_cb)
+        self.nav_listbox.select_row(self.nav_row_general)
+
+        # Initial engine status label
+        self._update_status_label()
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _set_backend_ui(self, index: int):
+        """Highlight the active backend card with suggested-action style."""
+        ctx_vosk    = self.backend_vosk_button.get_style_context()
+        ctx_whisper = self.backend_whisper_button.get_style_context()
+        if index == 0:
+            ctx_vosk.add_class("suggested-action")
+            ctx_whisper.remove_class("suggested-action")
+        else:
+            ctx_vosk.remove_class("suggested-action")
+            ctx_whisper.add_class("suggested-action")
+
+    def _update_status_label(self):
+        """Refresh the sidebar status chip based on current backend + model state."""
+        backend = self._settings.get_string("backend")
+        backend_name = "Vosk" if backend == "vosk" else "Whisper"
+        if self._engine.has_model():
+            self.status_label.set_label(_("%s · ready") % backend_name)
+            self.status_icon.set_from_icon_name("media-record-symbolic")
+        else:
+            self.status_label.set_label(_("%s · no model") % backend_name)
+            self.status_icon.set_from_icon_name("dialog-warning-symbolic")
+
+    def _navigate_to_category(self, stack_child, title: str):
+        """Switch into a shortcut category detail view."""
+        self.category_stack.set_visible_child(stack_child)
+        self.main_stack.set_visible_child(self.page_category)
+        self.page_title_label.set_label(title)
+        self.cancel_button.set_visible(True)
+        # Deselect sidebar so no item looks active in detail view
+        self.nav_listbox.unselect_all()
+
+    def _set_locale_rows_sensitivity(self):
+        for row in self._locales.values():
+            if row.check_button.get_active():
+                row.set_sensitive(True)
+            else:
+                row.set_sensitive(not self._current_locale.default_locale)
+
+    def _add_locale_row(self, locale_str):
+        if len(self._locales) == 0:
+            row = STTLocaleRow(current_locale=self._current_locale,
+                               locale_str=locale_str,
+                               radio_group=None)
+        elif self._locales.get(locale_str) is not None:
+            LOG_MSG.error("the locale is already included (%s)", locale_str)
+            return
+        else:
+            first_row = next(iter(self._locales.items()))[1]
+            row = STTLocaleRow(current_locale=self._current_locale,
+                               locale_str=locale_str,
+                               radio_group=first_row.check_button)
+
+        self.localelistbox.add(row)
+        self._locales[locale_str] = row
+
+    def _empty_shortcut_page(self):
+        self._valid_formatting_file_path = False
+        self._valid_formatting_file = False
+        self._valid_override_file = False
+
+        for row in self._values_dict.values():
+            row.pref_group.remove(row)
+
+        self.commands_row.set_visible(False)
+        self.case_row.set_visible(False)
+        self.diacritics_row.set_visible(False)
+        self.punctuation_row.set_visible(False)
+
+        self._values_dict = {}
+        self._utterances_dict = {}
+
+    def _load_current_locale(self):
+        row = self._locales.get(self._current_locale.locale)
+        if row is None:
+            self._add_locale_row(self._current_locale.locale)
+
+        self._empty_shortcut_page()
+        self._load_utterances()
+
+        if not self._engine.has_model():
+            self._engine_has_no_model()
+            return
+
+        if self._no_model_toast is not None:
+            self._no_model_toast.dismiss()
+            self._no_model_toast = None
+
+        if not self._valid_formatting_file:
+            self._unsupported_locale()
+        elif self._unsupported_locale_toast is not None:
+            self._unsupported_locale_toast.dismiss()
+            self._unsupported_locale_toast = None
+
+    # ── Settings / backend callbacks ───────────────────────────────────────
+
+    def _backend_changed_cb(self, settings, key):
+        backend = settings.get_string("backend")
+        self._set_backend_ui(0 if backend == "vosk" else 1)
+        self._update_status_label()
+        self._reload_locale_rows()
+
+    def _reload_locale_rows(self):
+        for row in self._locales.values():
+            if row.check_button.get_active():
+                row.set_sensitive(True)
+
+    # ── Signal handlers: navigation ────────────────────────────────────────
+
+    @Gtk.Template.Callback()
+    def nav_row_selected_cb(self, listbox, row):
+        """Switch main_stack when the user clicks a sidebar nav item."""
+        if row is None:
+            return
+        page, title = self._nav_map.get(row, (self.page_general, _("General")))
+        self.main_stack.set_visible_child(page)
+        self.page_title_label.set_label(title)
+        self.cancel_button.set_visible(False)
+
+    @Gtk.Template.Callback()
+    def cancel_button_clicked_cb(self, button):
+        """Return from category-detail view back to the Shortcuts page."""
+        self.main_stack.set_visible_child(self.page_shortcuts)
+        self.page_title_label.set_label(_("Shortcuts"))
+        self.cancel_button.set_visible(False)
+        self.nav_listbox.select_row(self.nav_row_shortcuts)
+
+    # ── Signal handlers: backend cards ─────────────────────────────────────
+
+    @Gtk.Template.Callback()
+    def backend_vosk_clicked_cb(self, button):
+        self._apply_backend_selection(0)
+
+    @Gtk.Template.Callback()
+    def backend_whisper_clicked_cb(self, button):
+        self._apply_backend_selection(1)
+
+    def _apply_backend_selection(self, index: int):
+        backend = "vosk" if index == 0 else "whisper"
+        current = self._settings.get_string("backend")
+        if backend != current:
+            self._settings.set_string("backend", backend)
+            # _backend_changed_cb fires automatically via the connect above
+        else:
+            # Still refresh the highlight in case the UI got out of sync
+            self._set_backend_ui(index)
+
+    # ── Signal handlers: locale / switches ─────────────────────────────────
+
+    @Gtk.Template.Callback()
+    def default_locale_switched_cb(self, switch, value):
+        if switch.get_active():
+            self._current_locale.locale = "None"
+        else:
+            self._current_locale.locale = self._current_locale.locale
+        self._set_locale_rows_sensitivity()
+
+    def _locale_changed_cb(self, current_locale):
+        if self.default_locale_switch.get_active() != self._current_locale.default_locale:
+            self.default_locale_switch.set_active(self._current_locale.default_locale)
+        self._set_locale_rows_sensitivity()
+        self._load_current_locale()
+
+    def _override_file_changed_cb(self, current_locale, deleted):
+        if not deleted and not self._override_file_written:
+            LOG_MSG.debug("override file changed")
+            self._load_current_locale()
+        self._override_file_written = False
+
+    # ── Signal handlers: shortcut file button ──────────────────────────────
+
+    @Gtk.Template.Callback()
+    def new_formatting_file_button_clicked_cb(self, button):
+        dialog = Gtk.FileChooserDialog(
+            transient_for=self,
+            title=_("Open Formatting File"),
+            modal=True,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            _("Cancel"), Gtk.ResponseType.CANCEL,
+            _("Open"),   Gtk.ResponseType.ACCEPT,
+        )
+        dialog.connect("response", self.open_locale_file_cb)
+        dialog.set_transient_for(self)
+        dialog.present()
+
+    def open_locale_file_cb(self, dialog, response):
+        if response != Gtk.ResponseType.ACCEPT:
+            dialog.destroy()
+            return
+        file = dialog.get_file()
+        dialog.destroy()
+        self._current_locale.formatting_file_path(file.get_path())
+
+    def _error_dialog_response_cb(self, dialog, response):
+        dialog.destroy()
+
+    # ── Signal handlers: shortcut category rows ────────────────────────────
+
+    @Gtk.Template.Callback()
+    def commands_row_activated_cb(self, row):
+        self._navigate_to_category(self.commandspage, _("Commands"))
+
+    @Gtk.Template.Callback()
+    def case_row_activated_cb(self, row):
+        self._navigate_to_category(self.casepage, _("Case"))
+
+    @Gtk.Template.Callback()
+    def diacritics_row_activated_cb(self, row):
+        self._navigate_to_category(self.diacriticspage, _("Diacritics"))
+
+    @Gtk.Template.Callback()
+    def punctuation_row_activated_cb(self, row):
+        self._navigate_to_category(self.punctuationpage, _("Punctuation"))
+
+    @Gtk.Template.Callback()
+    def custom_row_activated_cb(self, row):
+        self._navigate_to_category(self.custompage, _("Custom shortcuts"))
+
+    # ── Shortcut dialog ────────────────────────────────────────────────────
+
+    def _apply_change(self):
+        LOG_MSG.debug("override file being written")
+        self._override_file_written = True
+
+        json_data = {
+            "commands":    [],
+            "case":        [],
+            "diacritics":  [],
+            "punctuation": [],
+            "custom":      [],
+        }
+
+        write_changes = False
+        for row in self._values_dict.values():
+            value = row.get_json_data()
+            if value is None:
+                continue
+            write_changes = True
+            if row.pref_group == self.commandslistbox:
+                json_data["commands"].append(value)
+            elif row.pref_group == self.caselistbox:
+                json_data["case"].append(value)
+            elif row.pref_group == self.diacriticslistbox:
+                json_data["diacritics"].append(value)
+            elif row.pref_group == self.punctuationlistbox:
+                json_data["punctuation"].append(value)
+            elif row.pref_group == self.customlistbox:
+                json_data["custom"].append(value)
+
+        if write_changes:
+            self._current_locale.overriding = json_data
+
+    def shortcut_row_reset_cb(self, row):
+        for utterance in row._extra_utterances:
+            self._utterances_dict.pop(utterance)
+        self._apply_change()
+
+    def shortcut_row_deleted_cb(self, row):
+        self._values_dict.pop(row.value)
+        for utterance in row.utterances:
+            self._utterances_dict.pop(utterance)
+        for utterance in row._extra_utterances:
+            self._utterances_dict.pop(utterance)
+        parent = row.get_parent()
+        parent.remove(row)
+        self._apply_change()
+
+    def shortcut_dialog_response_cb(self, dialog, response):
+        if response == Gtk.ResponseType.APPLY:
+            added, removed = dialog.apply_to_row()
+            for u in added:
+                self._utterances_dict[u] = True
+            for u in removed:
+                self._utterances_dict.pop(u)
+            self._apply_change()
+        elif response == Gtk.ResponseType.OK:
+            row = dialog.get_new_row()
+            row.pref_group = self.customlistbox
+            self.customlistbox.add(row)
+            row.connect("activated", self.shortcut_row_activated_cb)
+            row.connect("delete",    self.shortcut_row_deleted_cb)
+            row.connect("reset",     self.shortcut_row_reset_cb)
+            self._values_dict[row.value] = row
+            for u in row._extra_utterances:
+                self._utterances_dict[u] = True
+            self._apply_change()
+        dialog.destroy()
+
+    def present_shortcut_dialog(self, row):
+        dialog = STTShortcutDialog(row=row, engine=self._engine, transient_for=self)
+        dialog.connect("response", self.shortcut_dialog_response_cb)
+        dialog.present()
+
+    def shortcut_row_activated_cb(self, row):
+        self.present_shortcut_dialog(row)
+
+    @Gtk.Template.Callback()
+    def new_shortcut_clicked_cb(self, button):
+        self.present_shortcut_dialog(None)
+
+    # ── Shortcut loading ───────────────────────────────────────────────────
+
+    def _load_section(self, json_data, section, listbox, cat_row):
+        item_list = json_data.get(section)
+        if item_list in (None, []):
+            if cat_row is not None:
+                cat_row.set_visible(False)
+            return
+
+        if cat_row is not None:
+            cat_row.set_visible(True)
+
+        for item in item_list:
+            value       = item.get("value")
+            utterances  = item.get("utterances")
+            description = item.get("description")
+
+            if isinstance(utterances, str):
+                utterances = [utterances]
+
+            for utterance in utterances[:]:
+                if self._utterances_dict.get(utterance, False):
+                    LOG_MSG.error("utterance already exists (%s)", utterance)
+                    utterances.remove(utterance)
+                    continue
+                self._utterances_dict[utterance] = True
+
+            key = value[0] if isinstance(value, list) else value
+            row = self._values_dict.get(key)
+
+            if row is None:
+                if not utterances:
+                    continue
+                row = STTShortcutRow(value=value, utterances=utterances,
+                                     description=description, editable=False,
+                                     pref_group=listbox)
+                listbox.add(row)
+                row.connect("activated", self.shortcut_row_activated_cb)
+                row.connect("reset",     self.shortcut_row_reset_cb)
+                self._values_dict[key] = row
+            else:
+                row.utterances  = list(set(row.utterances) | set(utterances))
+                row.description = description
+
+    def _load_section_override(self, item_list, listbox):
+        if item_list is None:
+            return
+
+        for item in item_list:
+            value       = item.get("value")
+            utterances  = item.get("utterances")
+            description = item.get("description")
+
+            if utterances not in (None, []):
+                if isinstance(utterances, str):
+                    utterances = [utterances]
+                for utterance in utterances[:]:
+                    if self._utterances_dict.get(utterance, False):
+                        LOG_MSG.error("utterance already exists (%s)", utterance)
+                        utterances.remove(utterance)
+                        continue
+                    self._utterances_dict[utterance] = True
+
+            key = value[0] if isinstance(value, list) else value
+            row = self._values_dict.get(key)
+
+            if row is not None:
+                if description is not None:
+                    row.description = description
+                if utterances not in (None, []):
+                    row.add_extra_utterances(utterances)
+            elif utterances not in (None, []):
+                row = STTShortcutRow(value=value, extra_utterances=utterances,
+                                     description=description, editable=True,
+                                     pref_group=listbox)
+                listbox.add(row)
+                row.connect("delete",    self.shortcut_row_deleted_cb)
+                row.connect("reset",     self.shortcut_row_reset_cb)
+                row.connect("activated", self.shortcut_row_activated_cb)
+                self._values_dict[key] = row
+
+    def _load_formatting_file(self):
+        LOG_MSG.debug("loading formatting file")
+        json_data = self._current_locale.formatting
+        if json_data is None:
+            return
+
+        self._load_section(json_data, "commands",    self.commandslistbox,    self.commands_row)
+        self._load_section(json_data, "case",        self.caselistbox,        self.case_row)
+        self._load_section(json_data, "diacritics",  self.diacriticslistbox,  self.diacritics_row)
+        self._load_section(json_data, "punctuation", self.punctuationlistbox, self.punctuation_row)
+        self._load_section(json_data, "custom",      self.customlistbox,      None)
+
+        self._valid_formatting_file = True
+
+    def _load_overriding_file(self):
+        LOG_MSG.debug("loading overriding file")
+        json_data = self._current_locale.overriding
+        if json_data is None:
+            return
+
+        self._load_section_override(json_data.get("commands"),    self.commandslistbox)
+        self._load_section_override(json_data.get("case"),        self.caselistbox)
+        self._load_section_override(json_data.get("diacritics"),  self.diacriticslistbox)
+        self._load_section_override(json_data.get("punctuation"), self.punctuationlistbox)
+        self._load_section_override(json_data.get("custom"),      self.customlistbox)
+
+        self._valid_override_file = True
+
+    def _load_utterances(self):
+        self._load_formatting_file()
+        if not self._valid_formatting_file:
+            self._empty_shortcut_page()
+        self._load_overriding_file()
+
+    # ── Toast helpers ──────────────────────────────────────────────────────
+
+    def _add_toast(self, toast):
+        """Wrapper so all toast calls go through AdwToastOverlay."""
+        self.toast_overlay.add_toast(toast)
+
+    def _manage_model_action_activated(self, action, param):
+        row = self._locales.get(self._current_locale.locale)
+        if row is not None:
+            row.manage_model()
+
+    def _toast_dismissed(self, toast):
+        if toast == self._no_model_toast:
+            self._no_model_toast = None
+            if not self._valid_formatting_file:
+                self._unsupported_locale()
+        else:
+            self._unsupported_locale_toast = None
+
+    def _unsupported_locale(self):
+        if self._no_model_toast is not None:
+            return
+        if self._unsupported_locale_toast is not None:
+            return
+
+        if self._valid_formatting_file_path:
+            msg = _("The file that defines automatic formatting for your locale "
+                    "does not have the proper format.")
+        else:
+            msg = _("A file that defines automatic formatting for your locale is "
+                    "missing. You can manually add one.")
+
+        self._unsupported_locale_toast = Adw.Toast(title=msg, timeout=0)
+        self._unsupported_locale_toast.connect("dismissed", self._toast_dismissed)
+        self._add_toast(self._unsupported_locale_toast)
+
+    def _engine_has_no_model(self):
+        if self._no_model_toast is not None:
+            return
+
+        if self._unsupported_locale_toast is not None:
+            self._unsupported_locale_toast.dismiss()
+            self._unsupported_locale_toast = None
+
+        self._no_model_toast = Adw.Toast(
+            title=_("There is no available model for the current locale"),
+            timeout=0,
+            button_label=_("Download Model"),
+            action_name="toast.manage_model",
+        )
+        self._no_model_toast.connect("dismissed", self._toast_dismissed)
+        self._add_toast(self._no_model_toast)
+
+    def _engine_model_changed_cb(self, engine):
+        if not engine.has_model():
+            self._engine_has_no_model()
+        elif self._no_model_toast is not None:
+            self._no_model_toast.dismiss()
+            self._no_model_toast = None
+        self._update_status_label()
+
+
+
+
+
+--------------------------
+
+sttlocalerow.py file 
+
+
+import locale
+import logging
+
+from gettext import gettext as _
+
+from babel import Locale, UnknownLocaleError
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+from gi.repository import Gtk, Adw, Gio
+
+from sttutils import *
+
+from sttvoskmodel import STTVoskModel
+from sttwhispermodel import STTWhisperModel
+from sttmodelchooserdialog import STTModelChooserDialog
+from sttvoskmodelmanagers import stt_vosk_online_model_manager
+from sttwhispermodelmanagers import stt_whisper_online_model_manager
+
+
+LOG_MSG = logging.getLogger()
+
+
+@Gtk.Template(resource_path="/org/freedesktop/ibus/engine/stt/config/sttlocalerow.ui")
+class STTLocaleRow(Adw.ActionRow):
+    __gtype_name__ = "STTLocaleRow"
+
+    check_button        = Gtk.Template.Child()
+    model_status_label  = Gtk.Template.Child()   # ← new: inline model status
+
+    def __init__(self, current_locale=None, locale_str=None, radio_group=None):
+        super().__init__()
+        if locale_str is None:
+            LOG_MSG.error("no locale provided")
+            return
+
+        self._locale = locale_str
+        system_locale_str = locale.getlocale()[0]
+        try:
+            babel_locale = Locale.parse(locale_str)
+            name = babel_locale.get_display_name(system_locale_str)
+        except UnknownLocaleError:
+            name = locale_str
+
+        if system_locale_str == self._locale:
+            name = _("%s : system locale") % name
+
+        self.set_title(name)
+
+        self._current_locale = current_locale
+        self._update_checked()
+        self._current_locale.connect("changed", self._locale_changed)
+
+        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._backend_changed_id = self._settings.connect(
+            "changed::backend", self._backend_changed_cb)
+
+        self._init_model()
+
+    # ── Model initialisation ───────────────────────────────────────────────
+
+    def _init_model(self):
+        backend = self._settings.get_string("backend")
+        self._model = (STTWhisperModel(locale_str=self._locale)
+                       if backend == "whisper"
+                       else STTVoskModel(locale_str=self._locale))
+        self._model.connect("changed", self._model_changed)
+        self.update_description()
+
+    @property
+    def locale(self):
+        return self._locale
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    @Gtk.Template.Callback()
+    def check_button_toggled_cb(self, button):
+        LOG_MSG.debug("check_button_toggled_cb (%s)", self._locale)
+        if button.get_active() == self._current_locale.default_locale:
+            return
+        if button.get_active():
+            self._current_locale.locale = self._locale
+
+    def _update_checked(self):
+        is_current = bool(self._current_locale.locale == self._locale)
+        if self.check_button.get_active() != is_current:
+            self.check_button.set_active(is_current)
+
+    def _locale_changed(self, current_locale):
+        self._update_checked()
+
+    def _backend_changed_cb(self, settings, key):
+        if hasattr(self, '_model') and self._model is not None:
+            self._model.disconnect_by_func(self._model_changed)
+        self._init_model()
+
+    @Gtk.Template.Callback()
+    def _manage_model_button_clicked_cb(self, button):
+        self.manage_model()
+
+    def manage_model(self):
+        window = STTModelChooserDialog(model=self._model)
+        window.set_transient_for(self.get_root())
+        window.present()
+
+    def _model_changed(self, model):
+        self.update_description()
+
+    # ── Description / status label ─────────────────────────────────────────
+
+    def update_description(self):
+        """
+        Update both the AdwActionRow subtitle (detailed, multi-line) and the
+        new inline model_status_label (short badge, e.g. "vosk-en-us · 1.8 GB").
+        """
+        if not self._model.available():
+            self.set_subtitle(_("No model downloaded yet"))
+            self._set_status_label(None, None)
+            return
+
+        model_name = self._model.get_name()
+        backend    = self._settings.get_string("backend")
+
+        # ── No name → custom / non-standard path ──────────────────────────
+        if model_name in (None, ""):
+            model_path = self._model.get_path()
+            if model_path and model_path != "":
+                self.set_subtitle(_("Custom model: %s") % model_path)
+                self._set_status_label(_("custom"), None)
+            else:
+                self.set_subtitle(
+                    _("Custom model installed manually in a non-standard directory"))
+                self._set_status_label(_("custom"), None)
+            return
+
+        manager = (stt_whisper_online_model_manager()
+                   if backend == "whisper"
+                   else stt_vosk_online_model_manager())
+        model = manager.get_model_description(model_name)
+
+        # ── Whisper ────────────────────────────────────────────────────────
+        if backend == "whisper":
+            if model is None:
+                self.set_subtitle(_("Unknown Whisper model"))
+                self._set_status_label(model_name, None)
+            else:
+                model_type = (model.type or "").capitalize()
+                size       = model.size or _("unknown size")
+                if model.locale == "en":
+                    self.set_subtitle(_("%s – English only – %s") % (model_type, size))
+                elif model.locale == "multilingual":
+                    self.set_subtitle(_("%s – Multilingual – %s") % (model_type, size))
+                else:
+                    self.set_subtitle(_("%s – %s") % (model_type, size))
+                self._set_status_label(model_name, size)
+            return
+
+        # ── Vosk ───────────────────────────────────────────────────────────
+        if model is None:
+            size = _("unknown size")
+        else:
+            size = model.size
+
+        if model is None:
+            description = _("No description available for the current model "
+                            "(name not found in online database)")
+        elif model.is_obsolete:
+            description = _("This model is obsolete - %s") % size
+        elif model.type is not None:
+            if model.type.startswith("big"):
+                description = _("Large model that may be more accurate than smaller ones - %s") % size
+            else:
+                description = _("Lightweight model for Android and RPi - %s") % size
+        else:
+            description = _("No description available for the current model "
+                            "(name not found in online database)")
+
+        self.set_subtitle(description)
+        self._set_status_label(model_name, size)
+
+    def _set_status_label(self, name: str | None, size: str | None):
+        """
+        Update the short inline badge shown to the right of the locale name.
+
+        Examples:
+            name="vosk-en-us-0.22"  size="1.8 GB"  →  "vosk-en-us · 1.8 GB"
+            name=None                               →  "no model"
+        """
+        if name is None:
+            self.model_status_label.set_label(_("no model"))
+            self.model_status_label.add_css_class("dim-label")
+        else:
+            # Shorten long model names for the badge (keep first 16 chars)
+            short = name if len(name) <= 16 else name[:16] + "…"
+            if size:
+                self.model_status_label.set_label("%s · %s" % (short, size))
+            else:
+                self.model_status_label.set_label(short)
+            self.model_status_label.remove_css_class("dim-label")
+
+
+
+
+--------------------
+sttconfidialog.ui file 
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="adw" version="1.1"/>
+
+  <template class="STTConfigDialog" parent="AdwWindow">
+    <property name="title" translatable="yes">IBus STT Setup</property>
+    <property name="default-width">780</property>
+    <property name="default-height">580</property>
+    <property name="modal">False</property>
+    <property name="icon-name">user-available-symbolic</property>
+
+    <child>
+      <!-- AdwToastOverlay is required because Adw.Window has no add_toast() -->
+      <object class="AdwToastOverlay" id="toast_overlay">
+        <property name="child">
+
+          <!-- Root vertical box: header bar on top, then sidebar+content below -->
+          <object class="GtkBox" id="root_box">
+            <property name="orientation">vertical</property>
+
+            <!-- ── Full-width header bar ─────────────────────────────── -->
+            <child>
+              <object class="AdwHeaderBar" id="headerbar">
+                <property name="show-start-title-buttons">True</property>
+                <property name="show-end-title-buttons">True</property>
+                <property name="title-widget">
+                  <object class="GtkLabel" id="page_title_label">
+                    <property name="label" translatable="yes">General</property>
+                    <style><class name="heading"/></style>
+                  </object>
+                </property>
+                <child type="start">
+                  <object class="GtkButton" id="cancel_button">
+                    <property name="visible">False</property>
+                    <property name="icon-name">go-previous-symbolic</property>
+                    <signal name="clicked" handler="cancel_button_clicked_cb"/>
+                  </object>
+                </child>
+              </object>
+            </child>
+
+            <!-- ── Body row: sidebar | separator | content ────────────── -->
+            <child>
+              <object class="GtkBox">
+                <property name="orientation">horizontal</property>
+                <property name="vexpand">True</property>
+
+                <!-- ── Sidebar ──────────────────────────────────────────── -->
+                <child>
+                  <object class="GtkBox" id="sidebar">
+                    <property name="orientation">vertical</property>
+                    <property name="width-request">200</property>
+                    <style><class name="navigation-sidebar"/></style>
+
+                    <!-- Status row -->
+                    <child>
+                      <object class="GtkBox" id="status_box">
+                        <property name="orientation">horizontal</property>
+                        <property name="spacing">6</property>
+                        <property name="margin-start">16</property>
+                        <property name="margin-end">16</property>
+                        <property name="margin-top">12</property>
+                        <property name="margin-bottom">6</property>
+                        <child>
+                          <object class="GtkImage" id="status_icon">
+                            <property name="icon-name">media-record-symbolic</property>
+                            <property name="pixel-size">12</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="status_label">
+                            <property name="label" translatable="yes">Engine inactive</property>
+                            <property name="ellipsize">end</property>
+                            <property name="xalign">0</property>
+                            <property name="hexpand">True</property>
+                            <style>
+                              <class name="caption"/>
+                              <class name="dim-label"/>
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+
+                    <!-- Navigation list -->
+                    <child>
+                      <object class="GtkListBox" id="nav_listbox">
+                        <property name="selection-mode">single</property>
+                        <property name="vexpand">True</property>
+                        <property name="margin-start">8</property>
+                        <property name="margin-end">8</property>
+                        <property name="margin-top">4</property>
+                        <property name="margin-bottom">8</property>
+                        <style><class name="navigation-sidebar"/></style>
+                        <signal name="row-selected" handler="nav_row_selected_cb"/>
+
+                        <child>
+                          <object class="GtkListBoxRow" id="nav_row_general">
+                            <property name="activatable">True</property>
+                            <property name="selectable">True</property>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">10</property>
+                                <property name="margin-start">10</property>
+                                <property name="margin-end">10</property>
+                                <property name="margin-top">8</property>
+                                <property name="margin-bottom">8</property>
+                                <child>
+                                  <object class="GtkImage">
+                                    <property name="icon-name">preferences-system-symbolic</property>
+                                    <property name="pixel-size">16</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label" translatable="yes">General</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="xalign">0</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+
+                        <child>
+                          <object class="GtkListBoxRow" id="nav_row_locales">
+                            <property name="activatable">True</property>
+                            <property name="selectable">True</property>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">10</property>
+                                <property name="margin-start">10</property>
+                                <property name="margin-end">10</property>
+                                <property name="margin-top">8</property>
+                                <property name="margin-bottom">8</property>
+                                <child>
+                                  <object class="GtkImage">
+                                    <property name="icon-name">preferences-desktop-locale-symbolic</property>
+                                    <property name="pixel-size">16</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label" translatable="yes">Locales</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="xalign">0</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+
+                        <child>
+                          <object class="GtkListBoxRow" id="nav_row_shortcuts">
+                            <property name="activatable">True</property>
+                            <property name="selectable">True</property>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">10</property>
+                                <property name="margin-start">10</property>
+                                <property name="margin-end">10</property>
+                                <property name="margin-top">8</property>
+                                <property name="margin-bottom">8</property>
+                                <child>
+                                  <object class="GtkImage">
+                                    <property name="icon-name">preferences-desktop-keyboard-shortcuts-symbolic</property>
+                                    <property name="pixel-size">16</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label" translatable="yes">Shortcuts</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="xalign">0</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+
+                      </object>
+                    </child>
+                  </object>
+                </child>
+
+                <!-- Divider -->
+                <child>
+                  <object class="GtkSeparator">
+                    <property name="orientation">vertical</property>
+                  </object>
+                </child>
+
+                <!-- ── Main content stack ────────────────────────────────── -->
+                <child>
+                  <object class="GtkStack" id="main_stack">
+                    <property name="hexpand">True</property>
+                    <property name="vexpand">True</property>
+                    <property name="transition-type">crossfade</property>
+
+                    <!-- ════════════ PAGE: General ════════════ -->
+                    <child>
+                      <object class="GtkScrolledWindow" id="page_general">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="vexpand">True</property>
+                        <property name="child">
+                          <object class="AdwClamp">
+                            <property name="maximum-size">560</property>
+                            <property name="child">
+                              <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">20</property>
+                                <property name="margin-start">20</property>
+                                <property name="margin-end">20</property>
+                                <property name="margin-top">20</property>
+                                <property name="margin-bottom">20</property>
+
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label" translatable="yes">Recognition backend</property>
+                                    <property name="xalign">0</property>
+                                    <property name="margin-start">4</property>
+                                    <style><class name="heading"/></style>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label" translatable="yes">Choose the engine used to convert your speech to text</property>
+                                    <property name="xalign">0</property>
+                                    <property name="wrap">True</property>
+                                    <property name="margin-start">4</property>
+                                    <property name="margin-top">-12</property>
+                                    <style>
+                                      <class name="caption"/>
+                                      <class name="dim-label"/>
+                                    </style>
+                                  </object>
+                                </child>
+
+                                <!-- Backend cards -->
+                                <child>
+                                  <object class="GtkBox" id="backend_cards_box">
+                                    <property name="orientation">horizontal</property>
+                                    <property name="spacing">12</property>
+                                    <property name="homogeneous">True</property>
+
+                                    <child>
+                                      <object class="GtkButton" id="backend_vosk_button">
+                                        <property name="hexpand">True</property>
+                                        <property name="valign">fill</property>
+                                        <signal name="clicked" handler="backend_vosk_clicked_cb"/>
+                                        <style><class name="card"/></style>
+                                        <property name="child">
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">6</property>
+                                            <property name="margin-start">14</property>
+                                            <property name="margin-end">14</property>
+                                            <property name="margin-top">14</property>
+                                            <property name="margin-bottom">14</property>
+                                            <child>
+                                              <object class="GtkImage">
+                                                <property name="icon-name">audio-input-microphone-symbolic</property>
+                                                <property name="pixel-size">22</property>
+                                                <property name="halign">start</property>
+                                                <property name="margin-bottom">4</property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label" translatable="yes">Vosk</property>
+                                                <property name="xalign">0</property>
+                                                <style><class name="heading"/></style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label" translatable="yes">Works fully offline. CPU-based. Good accuracy for most tasks.</property>
+                                                <property name="xalign">0</property>
+                                                <property name="wrap">True</property>
+                                                <property name="max-width-chars">24</property>
+                                                <style>
+                                                  <class name="caption"/>
+                                                  <class name="dim-label"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
+
+                                    <child>
+                                      <object class="GtkButton" id="backend_whisper_button">
+                                        <property name="hexpand">True</property>
+                                        <property name="valign">fill</property>
+                                        <signal name="clicked" handler="backend_whisper_clicked_cb"/>
+                                        <style><class name="card"/></style>
+                                        <property name="child">
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">6</property>
+                                            <property name="margin-start">14</property>
+                                            <property name="margin-end">14</property>
+                                            <property name="margin-top">14</property>
+                                            <property name="margin-bottom">14</property>
+                                            <child>
+                                              <object class="GtkImage">
+                                                <property name="icon-name">audio-speakers-symbolic</property>
+                                                <property name="pixel-size">22</property>
+                                                <property name="halign">start</property>
+                                                <property name="margin-bottom">4</property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label" translatable="yes">Whisper</property>
+                                                <property name="xalign">0</property>
+                                                <style><class name="heading"/></style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label" translatable="yes">Higher accuracy. Optional GPU acceleration. More resource use.</property>
+                                                <property name="xalign">0</property>
+                                                <property name="wrap">True</property>
+                                                <property name="max-width-chars">24</property>
+                                                <style>
+                                                  <class name="caption"/>
+                                                  <class name="dim-label"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
+
+                                  </object>
+                                </child>
+
+                                <!-- Behaviour group -->
+                                <child>
+                                  <object class="AdwPreferencesGroup">
+                                    <property name="title" translatable="yes">Behaviour</property>
+                                    <child>
+                                      <object class="AdwActionRow">
+                                        <property name="title" translatable="yes">Preload models</property>
+                                        <property name="subtitle" translatable="yes">Faster activation, uses more memory when idle</property>
+                                        <property name="activatable-widget">preload_model_switch</property>
+                                        <child type="suffix">
+                                          <object class="GtkSwitch" id="preload_model_switch">
+                                            <property name="valign">center</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow">
+                                        <property name="title" translatable="yes">Active on start</property>
+                                        <property name="subtitle" translatable="yes">Begin listening as soon as the engine loads</property>
+                                        <property name="activatable-widget">active_on_start_switch</property>
+                                        <child type="suffix">
+                                          <object class="GtkSwitch" id="active_on_start_switch">
+                                            <property name="valign">center</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow">
+                                        <property name="title" translatable="yes">Use system locale</property>
+                                        <property name="subtitle" translatable="yes">Automatically match your system language</property>
+                                        <property name="activatable-widget">default_locale_switch</property>
+                                        <child type="suffix">
+                                          <object class="GtkSwitch" id="default_locale_switch">
+                                            <property name="valign">center</property>
+                                            <signal name="notify::active" handler="default_locale_switched_cb"/>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+
+                    <!-- ════════════ PAGE: Locales ════════════ -->
+                    <child>
+                      <object class="GtkScrolledWindow" id="page_locales">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="vexpand">True</property>
+                        <property name="child">
+                          <object class="AdwClamp">
+                            <property name="maximum-size">560</property>
+                            <property name="child">
+                              <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">20</property>
+                                <property name="margin-start">20</property>
+                                <property name="margin-end">20</property>
+                                <property name="margin-top">20</property>
+                                <property name="margin-bottom">20</property>
+                                <child>
+                                  <object class="AdwPreferencesGroup" id="localelistbox">
+                                    <property name="title" translatable="yes">Locales &amp; models</property>
+                                    <property name="description" translatable="yes">Enable a locale and tap the model badge to download or switch models</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+
+                    <!-- ════════════ PAGE: Shortcuts ════════════ -->
+                    <child>
+                      <object class="GtkScrolledWindow" id="page_shortcuts">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="vexpand">True</property>
+                        <property name="child">
+                          <object class="AdwClamp">
+                            <property name="maximum-size">560</property>
+                            <property name="child">
+                              <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">20</property>
+                                <property name="margin-start">20</property>
+                                <property name="margin-end">20</property>
+                                <property name="margin-top">20</property>
+                                <property name="margin-bottom">20</property>
+                                <child>
+                                  <object class="AdwPreferencesGroup" id="categorylistbox">
+                                    <property name="title" translatable="yes">Shortcut categories</property>
+                                    <property name="header-suffix">
+                                      <object class="GtkButton" id="new_formatting_button">
+                                        <property name="icon_name">list-add-symbolic</property>
+                                        <style><class name="flat"/></style>
+                                        <signal name="clicked" handler="new_formatting_file_button_clicked_cb"/>
+                                      </object>
+                                    </property>
+                                    <child>
+                                      <object class="AdwActionRow" id="commands_row">
+                                        <property name="title" translatable="yes">Commands</property>
+                                        <property name="subtitle" translatable="yes">Voice commands for controlling input</property>
+                                        <property name="selectable">False</property>
+                                        <property name="activatable">True</property>
+                                        <signal name="activated" handler="commands_row_activated_cb"/>
+                                        <child type="prefix">
+                                          <object class="GtkImage">
+                                            <property name="icon-name">microphone-sensitivity-high-symbolic</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon_name">go-next-symbolic</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow" id="case_row">
+                                        <property name="title" translatable="yes">Case</property>
+                                        <property name="subtitle" translatable="yes">Uppercase, lowercase, title case</property>
+                                        <property name="selectable">False</property>
+                                        <property name="activatable">True</property>
+                                        <signal name="activated" handler="case_row_activated_cb"/>
+                                        <child type="prefix">
+                                          <object class="GtkImage">
+                                            <property name="icon-name">format-text-bold-symbolic</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon_name">go-next-symbolic</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow" id="punctuation_row">
+                                        <property name="title" translatable="yes">Punctuation</property>
+                                        <property name="subtitle" translatable="yes">Period, comma, question mark and more</property>
+                                        <property name="selectable">False</property>
+                                        <property name="activatable">True</property>
+                                        <signal name="activated" handler="punctuation_row_activated_cb"/>
+                                        <child type="prefix">
+                                          <object class="GtkImage">
+                                            <property name="icon-name">insert-text-symbolic</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon_name">go-next-symbolic</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow" id="diacritics_row">
+                                        <property name="title" translatable="yes">Diacritics</property>
+                                        <property name="subtitle" translatable="yes">Accented characters and special letters</property>
+                                        <property name="selectable">False</property>
+                                        <property name="activatable">True</property>
+                                        <signal name="activated" handler="diacritics_row_activated_cb"/>
+                                        <child type="prefix">
+                                          <object class="GtkImage">
+                                            <property name="icon-name">format-text-underline-symbolic</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon_name">go-next-symbolic</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwActionRow" id="custom_row">
+                                        <property name="title" translatable="yes">Custom shortcuts</property>
+                                        <property name="subtitle" translatable="yes">Your own voice-to-text substitutions</property>
+                                        <property name="selectable">False</property>
+                                        <property name="activatable">True</property>
+                                        <signal name="activated" handler="custom_row_activated_cb"/>
+                                        <child type="prefix">
+                                          <object class="GtkImage">
+                                            <property name="icon-name">starred-symbolic</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon_name">go-next-symbolic</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+
+                    <!-- ════════════ PAGE: Category detail ════════════ -->
+                    <child>
+                      <object class="GtkScrolledWindow" id="page_category">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="vexpand">True</property>
+                        <property name="hexpand">True</property>
+                        <property name="propagate-natural-width">True</property>
+                        <property name="propagate-natural-height">True</property>
+                        <property name="child">
+                          <object class="GtkBox">
+                            <property name="orientation">vertical</property>
+                            <child>
+                              <object class="AdwViewStack" id="category_stack">
+                                <property name="hexpand">True</property>
+                                <property name="vexpand">True</property>
+                                <property name="hhomogeneous">False</property>
+                                <property name="vhomogeneous">False</property>
+
+                                <child>
+                                  <object class="AdwClamp" id="commandspage">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="margin-top">18</property>
+                                        <property name="margin-bottom">18</property>
+                                        <property name="margin-start">18</property>
+                                        <property name="margin-end">18</property>
+                                        <child>
+                                          <object class="AdwPreferencesGroup" id="commandslistbox">
+                                            <property name="title" translatable="yes">Commands</property>
+                                            <property name="margin-top">12</property>
+                                            <property name="margin-bottom">12</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwClamp" id="casepage">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="margin-top">18</property>
+                                        <property name="margin-bottom">18</property>
+                                        <property name="margin-start">18</property>
+                                        <property name="margin-end">18</property>
+                                        <child>
+                                          <object class="AdwPreferencesGroup" id="caselistbox">
+                                            <property name="title" translatable="yes">Case</property>
+                                            <property name="margin-top">12</property>
+                                            <property name="margin-bottom">12</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwClamp" id="punctuationpage">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="margin-top">18</property>
+                                        <property name="margin-bottom">18</property>
+                                        <property name="margin-start">18</property>
+                                        <property name="margin-end">18</property>
+                                        <child>
+                                          <object class="AdwPreferencesGroup" id="punctuationlistbox">
+                                            <property name="title" translatable="yes">Punctuation</property>
+                                            <property name="margin-top">12</property>
+                                            <property name="margin-bottom">12</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwClamp" id="diacriticspage">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="margin-top">18</property>
+                                        <property name="margin-bottom">18</property>
+                                        <property name="margin-start">18</property>
+                                        <property name="margin-end">18</property>
+                                        <child>
+                                          <object class="AdwPreferencesGroup" id="diacriticslistbox">
+                                            <property name="title" translatable="yes">Diacritics</property>
+                                            <property name="margin-top">12</property>
+                                            <property name="margin-bottom">12</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwClamp" id="custompage">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="margin-top">18</property>
+                                        <property name="margin-bottom">18</property>
+                                        <property name="margin-start">18</property>
+                                        <property name="margin-end">18</property>
+                                        <child>
+                                          <object class="AdwPreferencesGroup" id="customlistbox">
+                                            <property name="title" translatable="yes">Custom shortcuts</property>
+                                            <property name="margin-top">12</property>
+                                            <property name="margin-bottom">12</property>
+                                            <property name="header-suffix">
+                                              <object class="GtkButton" id="new_shortcut_button">
+                                                <property name="icon_name">list-add-symbolic</property>
+                                                <style><class name="flat"/></style>
+                                                <signal name="clicked" handler="new_shortcut_clicked_cb"/>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                              </object>
+                            </child>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+
+                  </object> <!-- main_stack -->
+                </child>
+
+              </object>
+            </child>
+
+          </object> <!-- root_box -->
+        </property>
+      </object> <!-- toast_overlay -->
+    </child>
+
+  </template>
+</interface>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 sttconfigdialog.ui
 
 <?xml version="1.0" encoding="UTF-8"?>
