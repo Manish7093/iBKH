@@ -1,3 +1,1211 @@
+sttconfigdialog.ui
+
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="adw" version="1.1"/>
+
+  <template class="STTConfigDialog" parent="AdwWindow">
+    <property name="title" translatable="yes">IBus STT Setup</property>
+    <property name="default-width">780</property>
+    <property name="default-height">580</property>
+    <property name="modal">False</property>
+    <property name="icon-name">user-available-symbolic</property>
+
+    <child>
+      <!-- Root vertical box: header bar on top, then sidebar+content below -->
+      <object class="GtkBox" id="root_box">
+        <property name="orientation">vertical</property>
+
+        <!-- ── Full-width header bar ─────────────────────────────────── -->
+        <child>
+          <object class="AdwHeaderBar" id="headerbar">
+            <property name="show-start-title-buttons">True</property>
+            <property name="show-end-title-buttons">True</property>
+            <property name="title-widget">
+              <object class="GtkLabel" id="page_title_label">
+                <property name="label" translatable="yes">General</property>
+                <style>
+                  <class name="heading"/>
+                </style>
+              </object>
+            </property>
+            <!-- Back button shown only when in category-detail view -->
+            <child type="start">
+              <object class="GtkButton" id="cancel_button">
+                <property name="visible">False</property>
+                <property name="icon-name">go-previous-symbolic</property>
+                <signal name="clicked" handler="cancel_button_clicked_cb"/>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- ── Body row: sidebar | separator | content ───────────────── -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="vexpand">True</property>
+
+            <!-- ── Sidebar ────────────────────────────────────────────── -->
+            <child>
+              <object class="GtkBox" id="sidebar">
+                <property name="orientation">vertical</property>
+                <property name="width-request">200</property>
+                <style>
+                  <class name="navigation-sidebar"/>
+                </style>
+
+                <!-- Status indicator -->
+                <child>
+                  <object class="GtkBox" id="status_box">
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">6</property>
+                    <property name="margin-start">16</property>
+                    <property name="margin-end">16</property>
+                    <property name="margin-top">12</property>
+                    <property name="margin-bottom">6</property>
+                    <child>
+                      <object class="GtkImage" id="status_icon">
+                        <property name="icon-name">media-record-symbolic</property>
+                        <property name="pixel-size">12</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkLabel" id="status_label">
+                        <property name="label" translatable="yes">Engine inactive</property>
+                        <property name="ellipsize">end</property>
+                        <property name="xalign">0</property>
+                        <property name="hexpand">True</property>
+                        <style>
+                          <class name="caption"/>
+                          <class name="dim-label"/>
+                        </style>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+
+                <!-- Navigation list -->
+                <child>
+                  <object class="GtkListBox" id="nav_listbox">
+                    <property name="selection-mode">single</property>
+                    <property name="vexpand">True</property>
+                    <property name="margin-start">8</property>
+                    <property name="margin-end">8</property>
+                    <property name="margin-top">4</property>
+                    <property name="margin-bottom">8</property>
+                    <style>
+                      <class name="navigation-sidebar"/>
+                    </style>
+                    <signal name="row-selected" handler="nav_row_selected_cb"/>
+
+                    <!-- General -->
+                    <child>
+                      <object class="GtkListBoxRow" id="nav_row_general">
+                        <property name="activatable">True</property>
+                        <property name="selectable">True</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">10</property>
+                            <property name="margin-start">10</property>
+                            <property name="margin-end">10</property>
+                            <property name="margin-top">8</property>
+                            <property name="margin-bottom">8</property>
+                            <child>
+                              <object class="GtkImage">
+                                <property name="icon-name">preferences-system-symbolic</property>
+                                <property name="pixel-size">16</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">General</property>
+                                <property name="hexpand">True</property>
+                                <property name="xalign">0</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+
+                    <!-- Locales -->
+                    <child>
+                      <object class="GtkListBoxRow" id="nav_row_locales">
+                        <property name="activatable">True</property>
+                        <property name="selectable">True</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">10</property>
+                            <property name="margin-start">10</property>
+                            <property name="margin-end">10</property>
+                            <property name="margin-top">8</property>
+                            <property name="margin-bottom">8</property>
+                            <child>
+                              <object class="GtkImage">
+                                <property name="icon-name">preferences-desktop-locale-symbolic</property>
+                                <property name="pixel-size">16</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">Locales</property>
+                                <property name="hexpand">True</property>
+                                <property name="xalign">0</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+
+                    <!-- Shortcuts -->
+                    <child>
+                      <object class="GtkListBoxRow" id="nav_row_shortcuts">
+                        <property name="activatable">True</property>
+                        <property name="selectable">True</property>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">10</property>
+                            <property name="margin-start">10</property>
+                            <property name="margin-end">10</property>
+                            <property name="margin-top">8</property>
+                            <property name="margin-bottom">8</property>
+                            <child>
+                              <object class="GtkImage">
+                                <property name="icon-name">preferences-desktop-keyboard-shortcuts-symbolic</property>
+                                <property name="pixel-size">16</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">Shortcuts</property>
+                                <property name="hexpand">True</property>
+                                <property name="xalign">0</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+
+                  </object>
+                </child>
+              </object>
+            </child>
+
+            <!-- Sidebar / content separator -->
+            <child>
+              <object class="GtkSeparator">
+                <property name="orientation">vertical</property>
+              </object>
+            </child>
+
+            <!-- ── Main content stack ─────────────────────────────────── -->
+            <child>
+              <object class="GtkStack" id="main_stack">
+                <property name="hexpand">True</property>
+                <property name="vexpand">True</property>
+                <property name="transition-type">crossfade</property>
+
+                <!-- ══════════════ PAGE: General ══════════════ -->
+                <child>
+                  <object class="GtkScrolledWindow" id="page_general">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="vexpand">True</property>
+                    <property name="child">
+                      <object class="AdwClamp">
+                        <property name="maximum-size">560</property>
+                        <property name="child">
+                          <object class="GtkBox">
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">20</property>
+                            <property name="margin-start">20</property>
+                            <property name="margin-end">20</property>
+                            <property name="margin-top">20</property>
+                            <property name="margin-bottom">20</property>
+
+                            <!-- Backend section label -->
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">Recognition backend</property>
+                                <property name="xalign">0</property>
+                                <property name="margin-start">4</property>
+                                <style>
+                                  <class name="heading"/>
+                                </style>
+                              </object>
+                            </child>
+
+                            <!-- Backend selection sub-label -->
+                            <child>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">Choose the engine used to convert your speech to text</property>
+                                <property name="xalign">0</property>
+                                <property name="wrap">True</property>
+                                <property name="margin-start">4</property>
+                                <property name="margin-top">-12</property>
+                                <style>
+                                  <class name="caption"/>
+                                  <class name="dim-label"/>
+                                </style>
+                              </object>
+                            </child>
+
+                            <!-- Backend cards (side by side) -->
+                            <child>
+                              <object class="GtkBox" id="backend_cards_box">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">12</property>
+                                <property name="homogeneous">True</property>
+
+                                <!-- Vosk card -->
+                                <child>
+                                  <object class="GtkButton" id="backend_vosk_button">
+                                    <property name="hexpand">True</property>
+                                    <property name="valign">fill</property>
+                                    <signal name="clicked" handler="backend_vosk_clicked_cb"/>
+                                    <style>
+                                      <class name="card"/>
+                                    </style>
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">6</property>
+                                        <property name="margin-start">14</property>
+                                        <property name="margin-end">14</property>
+                                        <property name="margin-top">14</property>
+                                        <property name="margin-bottom">14</property>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon-name">audio-input-microphone-symbolic</property>
+                                            <property name="pixel-size">22</property>
+                                            <property name="halign">start</property>
+                                            <property name="margin-bottom">4</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label" translatable="yes">Vosk</property>
+                                            <property name="xalign">0</property>
+                                            <style>
+                                              <class name="heading"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label" translatable="yes">Works fully offline. CPU-based. Good accuracy for most tasks.</property>
+                                            <property name="xalign">0</property>
+                                            <property name="wrap">True</property>
+                                            <property name="max-width-chars">24</property>
+                                            <style>
+                                              <class name="caption"/>
+                                              <class name="dim-label"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                                <!-- Whisper card -->
+                                <child>
+                                  <object class="GtkButton" id="backend_whisper_button">
+                                    <property name="hexpand">True</property>
+                                    <property name="valign">fill</property>
+                                    <signal name="clicked" handler="backend_whisper_clicked_cb"/>
+                                    <style>
+                                      <class name="card"/>
+                                    </style>
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">6</property>
+                                        <property name="margin-start">14</property>
+                                        <property name="margin-end">14</property>
+                                        <property name="margin-top">14</property>
+                                        <property name="margin-bottom">14</property>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon-name">audio-speakers-symbolic</property>
+                                            <property name="pixel-size">22</property>
+                                            <property name="halign">start</property>
+                                            <property name="margin-bottom">4</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label" translatable="yes">Whisper</property>
+                                            <property name="xalign">0</property>
+                                            <style>
+                                              <class name="heading"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label" translatable="yes">Higher accuracy. Optional GPU acceleration. More resource use.</property>
+                                            <property name="xalign">0</property>
+                                            <property name="wrap">True</property>
+                                            <property name="max-width-chars">24</property>
+                                            <style>
+                                              <class name="caption"/>
+                                              <class name="dim-label"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+
+                              </object>
+                            </child>
+
+                            <!-- Behaviour preferences group -->
+                            <child>
+                              <object class="AdwPreferencesGroup">
+                                <property name="title" translatable="yes">Behaviour</property>
+                                <child>
+                                  <object class="AdwActionRow">
+                                    <property name="title" translatable="yes">Preload models</property>
+                                    <property name="subtitle" translatable="yes">Faster activation, uses more memory when idle</property>
+                                    <property name="activatable-widget">preload_model_switch</property>
+                                    <child type="suffix">
+                                      <object class="GtkSwitch" id="preload_model_switch">
+                                        <property name="valign">center</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="AdwActionRow">
+                                    <property name="title" translatable="yes">Active on start</property>
+                                    <property name="subtitle" translatable="yes">Begin listening as soon as the engine loads</property>
+                                    <property name="activatable-widget">active_on_start_switch</property>
+                                    <child type="suffix">
+                                      <object class="GtkSwitch" id="active_on_start_switch">
+                                        <property name="valign">center</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="AdwActionRow">
+                                    <property name="title" translatable="yes">Use system locale</property>
+                                    <property name="subtitle" translatable="yes">Automatically match your system language</property>
+                                    <property name="activatable-widget">default_locale_switch</property>
+                                    <child type="suffix">
+                                      <object class="GtkSwitch" id="default_locale_switch">
+                                        <property name="valign">center</property>
+                                        <signal name="notify::active" handler="default_locale_switched_cb"/>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+
+                <!-- ══════════════ PAGE: Locales ══════════════ -->
+                <child>
+                  <object class="GtkScrolledWindow" id="page_locales">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="vexpand">True</property>
+                    <property name="child">
+                      <object class="AdwClamp">
+                        <property name="maximum-size">560</property>
+                        <property name="child">
+                          <object class="GtkBox">
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">20</property>
+                            <property name="margin-start">20</property>
+                            <property name="margin-end">20</property>
+                            <property name="margin-top">20</property>
+                            <property name="margin-bottom">20</property>
+                            <!-- Locale rows are added programmatically into localelistbox -->
+                            <child>
+                              <object class="AdwPreferencesGroup" id="localelistbox">
+                                <property name="title" translatable="yes">Locales &amp; models</property>
+                                <property name="description" translatable="yes">Enable a locale and tap the model badge to download or switch models</property>
+                              </object>
+                            </child>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+
+                <!-- ══════════════ PAGE: Shortcuts ══════════════ -->
+                <child>
+                  <object class="GtkScrolledWindow" id="page_shortcuts">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="vexpand">True</property>
+                    <property name="child">
+                      <object class="AdwClamp">
+                        <property name="maximum-size">560</property>
+                        <property name="child">
+                          <object class="GtkBox">
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">20</property>
+                            <property name="margin-start">20</property>
+                            <property name="margin-end">20</property>
+                            <property name="margin-top">20</property>
+                            <property name="margin-bottom">20</property>
+                            <child>
+                              <object class="AdwPreferencesGroup" id="categorylistbox">
+                                <property name="title" translatable="yes">Shortcut categories</property>
+                                <property name="header-suffix">
+                                  <object class="GtkButton" id="new_formatting_button">
+                                    <property name="icon_name">list-add-symbolic</property>
+                                    <style>
+                                      <class name="flat"/>
+                                    </style>
+                                    <signal name="clicked" handler="new_formatting_file_button_clicked_cb"/>
+                                  </object>
+                                </property>
+
+                                <child>
+                                  <object class="AdwActionRow" id="commands_row">
+                                    <property name="title" translatable="yes">Commands</property>
+                                    <property name="subtitle" translatable="yes">Voice commands for controlling input</property>
+                                    <property name="selectable">False</property>
+                                    <property name="activatable">True</property>
+                                    <signal name="activated" handler="commands_row_activated_cb"/>
+                                    <child type="prefix">
+                                      <object class="GtkImage">
+                                        <property name="icon-name">microphone-sensitivity-high-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon_name">go-next-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwActionRow" id="case_row">
+                                    <property name="title" translatable="yes">Case</property>
+                                    <property name="subtitle" translatable="yes">Uppercase, lowercase, title case</property>
+                                    <property name="selectable">False</property>
+                                    <property name="activatable">True</property>
+                                    <signal name="activated" handler="case_row_activated_cb"/>
+                                    <child type="prefix">
+                                      <object class="GtkImage">
+                                        <property name="icon-name">format-text-bold-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon_name">go-next-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwActionRow" id="punctuation_row">
+                                    <property name="title" translatable="yes">Punctuation</property>
+                                    <property name="subtitle" translatable="yes">Period, comma, question mark and more</property>
+                                    <property name="selectable">False</property>
+                                    <property name="activatable">True</property>
+                                    <signal name="activated" handler="punctuation_row_activated_cb"/>
+                                    <child type="prefix">
+                                      <object class="GtkImage">
+                                        <property name="icon-name">insert-text-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon_name">go-next-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwActionRow" id="diacritics_row">
+                                    <property name="title" translatable="yes">Diacritics</property>
+                                    <property name="subtitle" translatable="yes">Accented characters and special letters</property>
+                                    <property name="selectable">False</property>
+                                    <property name="activatable">True</property>
+                                    <signal name="activated" handler="diacritics_row_activated_cb"/>
+                                    <child type="prefix">
+                                      <object class="GtkImage">
+                                        <property name="icon-name">format-text-underline-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon_name">go-next-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                                <child>
+                                  <object class="AdwActionRow" id="custom_row">
+                                    <property name="title" translatable="yes">Custom shortcuts</property>
+                                    <property name="subtitle" translatable="yes">Your own voice-to-text substitutions</property>
+                                    <property name="selectable">False</property>
+                                    <property name="activatable">True</property>
+                                    <signal name="activated" handler="custom_row_activated_cb"/>
+                                    <child type="prefix">
+                                      <object class="GtkImage">
+                                        <property name="icon-name">starred-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon_name">go-next-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+
+                              </object>
+                            </child>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+
+                <!-- ══════════════ PAGE: Category detail ══════════════ -->
+                <!--
+                  Replaces the old top-level categorypage GtkBox that was
+                  pushed onto AdwPreferencesWindow as a subpage.
+                  Now it is a named page of main_stack.
+                  Python: switch to this page with
+                      self.main_stack.set_visible_child(self.page_category)
+                  and back with
+                      self.main_stack.set_visible_child(self.page_shortcuts)
+                -->
+                <child>
+                  <object class="GtkScrolledWindow" id="page_category">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="vexpand">True</property>
+                    <property name="hexpand">True</property>
+                    <property name="propagate-natural-width">True</property>
+                    <property name="propagate-natural-height">True</property>
+                    <property name="child">
+                      <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <child>
+                          <object class="AdwViewStack" id="category_stack">
+                            <property name="hexpand">True</property>
+                            <property name="vexpand">True</property>
+                            <property name="hhomogeneous">False</property>
+                            <property name="vhomogeneous">False</property>
+
+                            <!-- Commands sub-page -->
+                            <child>
+                              <object class="AdwClamp" id="commandspage">
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
+                                    <child>
+                                      <object class="AdwPreferencesGroup" id="commandslistbox">
+                                        <property name="title" translatable="yes">Commands</property>
+                                        <property name="margin-top">12</property>
+                                        <property name="margin-bottom">12</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+
+                            <!-- Case sub-page -->
+                            <child>
+                              <object class="AdwClamp" id="casepage">
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
+                                    <child>
+                                      <object class="AdwPreferencesGroup" id="caselistbox">
+                                        <property name="title" translatable="yes">Case</property>
+                                        <property name="margin-top">12</property>
+                                        <property name="margin-bottom">12</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+
+                            <!-- Punctuation sub-page -->
+                            <child>
+                              <object class="AdwClamp" id="punctuationpage">
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
+                                    <child>
+                                      <object class="AdwPreferencesGroup" id="punctuationlistbox">
+                                        <property name="title" translatable="yes">Punctuation</property>
+                                        <property name="margin-top">12</property>
+                                        <property name="margin-bottom">12</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+
+                            <!-- Diacritics sub-page -->
+                            <child>
+                              <object class="AdwClamp" id="diacriticspage">
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
+                                    <child>
+                                      <object class="AdwPreferencesGroup" id="diacriticslistbox">
+                                        <property name="title" translatable="yes">Diacritics</property>
+                                        <property name="margin-top">12</property>
+                                        <property name="margin-bottom">12</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+
+                            <!-- Custom shortcuts sub-page -->
+                            <child>
+                              <object class="AdwClamp" id="custompage">
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
+                                    <child>
+                                      <object class="AdwPreferencesGroup" id="customlistbox">
+                                        <property name="title" translatable="yes">Custom shortcuts</property>
+                                        <property name="margin-top">12</property>
+                                        <property name="margin-bottom">12</property>
+                                        <property name="header-suffix">
+                                          <object class="GtkButton" id="new_shortcut_button">
+                                            <property name="icon_name">list-add-symbolic</property>
+                                            <style>
+                                              <class name="flat"/>
+                                            </style>
+                                            <signal name="clicked" handler="new_shortcut_clicked_cb"/>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+
+                          </object>
+                        </child>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+
+              </object> <!-- main_stack -->
+            </child>
+
+          </object>
+        </child>
+
+      </object>
+    </child>
+  </template>
+
+</interface>
+
+
+sttlocalerow.ui
+
+
+
+<?xml version='1.0' encoding='UTF-8'?>
+<interface>
+  <requires lib="gtk+" version="4.0"/>
+  <!--
+    STTLocaleRow – now shows inline model status so users never need to open
+    a separate dialog just to know whether a model is present.
+
+    Suffix order (left → right):
+      model_status_label   short text: "vosk-en-us · 1.8 GB" or "no model"
+      model_button         icon button: opens STTModelChooserDialog as before
+  -->
+  <template class="STTLocaleRow" parent="AdwActionRow">
+    <property name="selectable">False</property>
+    <property name="activatable">True</property>
+    <property name="activatable-widget">check_button</property>
+
+    <!-- Check button on the left -->
+    <child type="prefix">
+      <object class="GtkCheckButton" id="check_button">
+        <property name="valign">center</property>
+        <signal name="toggled" handler="check_button_toggled_cb"/>
+      </object>
+    </child>
+
+    <!-- Model status label (set programmatically by STTLocaleRow code) -->
+    <child type="suffix">
+      <object class="GtkLabel" id="model_status_label">
+        <property name="label" translatable="yes">no model</property>
+        <property name="valign">center</property>
+        <property name="ellipsize">end</property>
+        <property name="max-width-chars">20</property>
+        <style>
+          <class name="caption"/>
+          <class name="dim-label"/>
+        </style>
+      </object>
+    </child>
+
+    <!-- Model manage button (opens STTModelChooserDialog) -->
+    <child type="suffix">
+      <object class="GtkButton" id="model_button">
+        <property name="visible">True</property>
+        <property name="halign">end</property>
+        <property name="valign">center</property>
+        <property name="icon_name">view-more-symbolic</property>
+        <property name="tooltip-text" translatable="yes">Manage models for this locale</property>
+        <property name="use-underline">True</property>
+        <signal name="clicked" handler="_manage_model_button_clicked_cb"/>
+        <style>
+          <class name="circular"/>
+          <class name="flat"/>
+        </style>
+      </object>
+    </child>
+
+  </template>
+</interface>
+
+
+"""
+sttconfigdialog_changes.py
+==========================
+Drop-in additions / replacements for your existing sttconfigdialog.py.
+
+STEP 1 – Change the class parent
+---------------------------------
+OLD:  class STTConfigDialog(Adw.PreferencesWindow):
+NEW:  class STTConfigDialog(Adw.Window):
+
+The __gtype_name__ and @Gtk.Template decorator stay the same.
+
+
+STEP 2 – Add new template children
+------------------------------------
+Add these @Gtk.Template.Child() declarations alongside your existing ones:
+
+    nav_listbox         = Gtk.Template.Child()
+    nav_row_general     = Gtk.Template.Child()
+    nav_row_locales     = Gtk.Template.Child()
+    nav_row_shortcuts   = Gtk.Template.Child()
+
+    main_stack          = Gtk.Template.Child()
+    page_general        = Gtk.Template.Child()
+    page_locales        = Gtk.Template.Child()
+    page_shortcuts      = Gtk.Template.Child()
+    page_category       = Gtk.Template.Child()
+
+    page_title_label    = Gtk.Template.Child()
+    cancel_button       = Gtk.Template.Child()
+    status_label        = Gtk.Template.Child()
+    status_icon         = Gtk.Template.Child()
+
+    backend_vosk_button    = Gtk.Template.Child()
+    backend_whisper_button = Gtk.Template.Child()
+
+REMOVE these (no longer in the UI):
+    backend_dropdown    (was AdwComboRow – replaced by cards)
+    # categorypage      (now page_category inside main_stack)
+
+
+STEP 3 – Page navigation maps
+-------------------------------
+Add a class-level dict to map nav rows → (stack page, title string):
+"""
+
+# ── Inside STTConfigDialog ──────────────────────────────────────────────────
+
+_NAV_MAP = None  # populated in __init__ after template children are ready
+
+def _build_nav_map(self):
+    self._NAV_MAP = {
+        self.nav_row_general:   (self.page_general,   _("General")),
+        self.nav_row_locales:   (self.page_locales,   _("Locales")),
+        self.nav_row_shortcuts: (self.page_shortcuts,  _("Shortcuts")),
+    }
+
+# Call _build_nav_map() at the END of __init__ / do_init(), then:
+#   self.nav_listbox.select_row(self.nav_row_general)
+
+
+# ── New / changed signal handlers ──────────────────────────────────────────
+
+@Gtk.Template.Callback()
+def nav_row_selected_cb(self, listbox, row):
+    """Switch main_stack when the user clicks a sidebar nav item."""
+    if row is None:
+        return
+    if self._NAV_MAP is None:
+        self._build_nav_map()
+    page, title = self._NAV_MAP.get(row, (self.page_general, _("General")))
+    self.main_stack.set_visible_child(page)
+    self.page_title_label.set_label(title)
+    # Hide back button when on top-level pages
+    self.cancel_button.set_visible(False)
+
+
+@Gtk.Template.Callback()
+def cancel_button_clicked_cb(self, button):
+    """Return from category-detail view back to the Shortcuts page."""
+    self.main_stack.set_visible_child(self.page_shortcuts)
+    self.page_title_label.set_label(_("Shortcuts"))
+    self.cancel_button.set_visible(False)
+    # Re-select the Shortcuts nav row so the sidebar stays in sync
+    self.nav_listbox.select_row(self.nav_row_shortcuts)
+
+
+@Gtk.Template.Callback()
+def backend_vosk_clicked_cb(self, button):
+    """User selected Vosk backend card."""
+    self._set_backend(0)          # 0 = Vosk index (same as old dropdown)
+
+
+@Gtk.Template.Callback()
+def backend_whisper_clicked_cb(self, button):
+    """User selected Whisper backend card."""
+    self._set_backend(1)          # 1 = Whisper index
+
+
+def _set_backend(self, index: int):
+    """
+    Apply visual selection state to the cards and persist the choice.
+    Mirror whatever backend_dropdown_selected_cb used to do.
+    """
+    vosk_selected    = (index == 0)
+    whisper_selected = (index == 1)
+
+    # Toggle the 'suggested-action' style class to highlight the active card
+    ctx_vosk    = self.backend_vosk_button.get_style_context()
+    ctx_whisper = self.backend_whisper_button.get_style_context()
+
+    if vosk_selected:
+        ctx_vosk.add_class("suggested-action")
+        ctx_whisper.remove_class("suggested-action")
+    else:
+        ctx_vosk.remove_class("suggested-action")
+        ctx_whisper.add_class("suggested-action")
+
+    # ── Persist your setting here the same way backend_dropdown_selected_cb
+    # used to do, e.g.:
+    #   self.settings.set_int("backend", index)
+    # or call whatever existing helper you had.
+
+
+# ── Helper called by category row handlers ──────────────────────────────────
+
+def _navigate_to_category(self, stack_child, title: str):
+    """
+    Switch into the category-detail view.
+    Called by commands_row_activated_cb, case_row_activated_cb, etc.
+
+    Replace the old  self.push_subpage(self.categorypage)  calls with:
+        self._navigate_to_category(self.commandspage, _("Commands"))
+    """
+    self.category_stack.set_visible_child(stack_child)
+    self.main_stack.set_visible_child(self.page_category)
+    self.page_title_label.set_label(title)
+    self.cancel_button.set_visible(True)
+    # Deselect sidebar so no nav item looks active while in detail view
+    self.nav_listbox.unselect_all()
+
+
+# ── Update existing category row handlers like this: ───────────────────────
+#
+# @Gtk.Template.Callback()
+# def commands_row_activated_cb(self, row):
+#     self._navigate_to_category(self.commandspage, _("Commands"))
+#
+# @Gtk.Template.Callback()
+# def case_row_activated_cb(self, row):
+#     self._navigate_to_category(self.casepage, _("Case"))
+#
+# @Gtk.Template.Callback()
+# def punctuation_row_activated_cb(self, row):
+#     self._navigate_to_category(self.punctuationpage, _("Punctuation"))
+#
+# @Gtk.Template.Callback()
+# def diacritics_row_activated_cb(self, row):
+#     self._navigate_to_category(self.diacriticspage, _("Diacritics"))
+#
+# @Gtk.Template.Callback()
+# def custom_row_activated_cb(self, row):
+#     self._navigate_to_category(self.custompage, _("Custom shortcuts"))
+
+
+# ── STTLocaleRow: expose model_status_label ─────────────────────────────────
+#
+# In sttlocalerow.py add:
+#
+#   model_status_label = Gtk.Template.Child()
+#
+# Then wherever you currently update the model name / state, also call:
+#
+#   def update_model_status(self, model_name: str | None, size: str = ""):
+#       if model_name:
+#           text = f"{model_name}"
+#           if size:
+#               text += f" · {size}"
+#           self.model_status_label.set_label(text)
+#           self.model_status_label.remove_css_class("dim-label")
+#       else:
+#           self.model_status_label.set_label(_("no model"))
+#           self.model_status_label.add_css_class("dim-label")
+
+
+
+
+#!/usr/bin/env bash
+# =============================================================================
+# apply_patch.sh  –  IBus STT UI redesign patch
+#
+# Usage:
+#   chmod +x apply_patch.sh
+#   ./apply_patch.sh /path/to/ibus-speech-to-text
+#
+# What it does:
+#   1. Verifies the target looks like an ibus-stt source tree.
+#   2. Creates timestamped backups of every file it will overwrite.
+#   3. Copies the new UI files into engine/.
+#   4. Prints a reminder of the Python changes still needed.
+# =============================================================================
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+NC='\033[0m'
+
+info()  { echo -e "${GRN}[INFO]${NC}  $*"; }
+warn()  { echo -e "${YLW}[WARN]${NC}  $*"; }
+error() { echo -e "${RED}[ERR] ${NC}  $*" >&2; }
+
+# ── Argument check ────────────────────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <path-to-ibus-speech-to-text-source>"
+  exit 1
+fi
+
+SRC_ROOT="$(realpath "$1")"
+ENGINE_DIR="$SRC_ROOT/engine"
+
+if [[ ! -d "$ENGINE_DIR" ]]; then
+  error "Cannot find engine/ directory under $SRC_ROOT"
+  error "Please pass the root of the ibus-speech-to-text source tree."
+  exit 1
+fi
+
+if [[ ! -f "$ENGINE_DIR/sttconfigdialog.ui" ]]; then
+  error "sttconfigdialog.ui not found in $ENGINE_DIR – wrong directory?"
+  exit 1
+fi
+
+# ── Locate patch files (same directory as this script) ────────────────────────
+PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+NEW_CONFIG_UI="$PATCH_DIR/engine/sttconfigdialog.ui"
+NEW_LOCALE_UI="$PATCH_DIR/engine/sttlocalerow.ui"
+PY_CHANGES="$PATCH_DIR/sttconfigdialog_changes.py"
+
+for f in "$NEW_CONFIG_UI" "$NEW_LOCALE_UI" "$PY_CHANGES"; do
+  if [[ ! -f "$f" ]]; then
+    error "Patch file missing: $f"
+    exit 1
+  fi
+done
+
+# ── Backup ────────────────────────────────────────────────────────────────────
+STAMP="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$SRC_ROOT/.ui_backup_$STAMP"
+mkdir -p "$BACKUP_DIR"
+info "Backing up original UI files → $BACKUP_DIR"
+
+UI_FILES=(
+  sttconfigdialog.ui
+  sttlocalerow.ui
+  sttmodelchooserdialog.ui
+  sttmodelrow.ui
+  sttshortcutdialog.ui
+  sttshortcutrow.ui
+  sttutterancerow.ui
+)
+
+for ui in "${UI_FILES[@]}"; do
+  src="$ENGINE_DIR/$ui"
+  if [[ -f "$src" ]]; then
+    cp "$src" "$BACKUP_DIR/$ui"
+    info "  backed up $ui"
+  else
+    warn "  $ui not found – skipping backup for this file"
+  fi
+done
+
+# ── Apply new UI files ────────────────────────────────────────────────────────
+info "Applying new UI files…"
+
+cp "$NEW_CONFIG_UI" "$ENGINE_DIR/sttconfigdialog.ui"
+info "  ✓ sttconfigdialog.ui"
+
+cp "$NEW_LOCALE_UI"  "$ENGINE_DIR/sttlocalerow.ui"
+info "  ✓ sttlocalerow.ui"
+
+cp "$PY_CHANGES" "$ENGINE_DIR/sttconfigdialog_changes.py"
+info "  ✓ sttconfigdialog_changes.py  (reference – not imported automatically)"
+
+# ── Validate XML syntax of the new files ─────────────────────────────────────
+info "Validating XML syntax…"
+if command -v xmllint &>/dev/null; then
+  xmllint --noout "$ENGINE_DIR/sttconfigdialog.ui" \
+    && info "  ✓ sttconfigdialog.ui  XML OK" \
+    || { error "sttconfigdialog.ui failed XML validation"; exit 1; }
+  xmllint --noout "$ENGINE_DIR/sttlocalerow.ui" \
+    && info "  ✓ sttlocalerow.ui  XML OK" \
+    || { error "sttlocalerow.ui failed XML validation"; exit 1; }
+else
+  warn "xmllint not found – skipping XML validation (install libxml2-utils)"
+fi
+
+# ── GtkBuilder compile check (optional) ──────────────────────────────────────
+if command -v gtk4-builder-tool &>/dev/null; then
+  info "Running gtk4-builder-tool simplify checks…"
+  gtk4-builder-tool simplify --3to4 "$ENGINE_DIR/sttconfigdialog.ui" \
+    > /dev/null 2>&1 \
+    && info "  ✓ sttconfigdialog.ui passes builder tool" \
+    || warn "  gtk4-builder-tool reported warnings (may be non-fatal)"
+else
+  warn "gtk4-builder-tool not found – skipping builder check"
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GRN}══════════════════════════════════════════════════════${NC}"
+echo -e "${GRN}  UI patch applied successfully!${NC}"
+echo -e "${GRN}══════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${YLW}MANUAL PYTHON CHANGES STILL REQUIRED${NC}"
+echo "  See: $ENGINE_DIR/sttconfigdialog_changes.py"
+echo ""
+echo "  1. Change class parent:"
+echo "       class STTConfigDialog(Adw.PreferencesWindow):"
+echo "     →  class STTConfigDialog(Adw.Window):"
+echo ""
+echo "  2. Add Template.Child() declarations for new widgets:"
+echo "       nav_listbox, main_stack, page_general, page_locales,"
+echo "       page_shortcuts, page_category, page_title_label,"
+echo "       cancel_button, status_label, status_icon,"
+echo "       backend_vosk_button, backend_whisper_button"
+echo ""
+echo "  3. Remove Template.Child() for:"
+echo "       backend_dropdown   (ComboRow removed from UI)"
+echo ""
+echo "  4. Add new signal handlers (copy from sttconfigdialog_changes.py):"
+echo "       nav_row_selected_cb"
+echo "       backend_vosk_clicked_cb"
+echo "       backend_whisper_clicked_cb"
+echo "       cancel_button_clicked_cb  (replace old subpage-pop version)"
+echo ""
+echo "  5. Replace push_subpage() calls in category row handlers with:"
+echo "       self._navigate_to_category(self.<page>, _(\"Title\"))"
+echo ""
+echo "  6. In STTLocaleRow (sttlocalerow.py) add:"
+echo "       model_status_label = Gtk.Template.Child()"
+echo "     and call update_model_status() whenever the model changes."
+echo ""
+echo "Backups saved to: $BACKUP_DIR"
+echo "To revert:  cp $BACKUP_DIR/*.ui $ENGINE_DIR/"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 elif isinstance(self._desc, STTWhisperModelDescription):
