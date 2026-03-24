@@ -1,3 +1,49 @@
+Traceback (most recent call last):
+  File "/usr/share/ibus-stt/main.py", line 124, in do_activate
+    stt_gst_factory_default()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/share/ibus-stt/sttgstfactory.py", line 88, in stt_gst_factory_default
+    _GLOBAL_FACTORY = STTGstFactory()
+  File "/usr/share/ibus-stt/sttgstfactory.py", line 43, in __init__
+    self.__update_preloaded_engine()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/share/ibus-stt/sttgstfactory.py", line 70, in __update_preloaded_engine
+    self._preload=self.new_engine()
+                  ~~~~~~~~~~~~~~~^^
+  File "/usr/share/ibus-stt/sttgstfactory.py", line 53, in new_engine
+    engine=STTGstWhisper()
+  File "/usr/share/ibus-stt/sttgstwhisper.py", line 80, in __init__
+    self._set_model()
+    ~~~~~~~~~~~~~~~^^
+  File "/usr/share/ibus-stt/sttgstwhisper.py", line 233, in _set_model
+    self._set_model_path()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/share/ibus-stt/sttgstwhisper.py", line 213, in _set_model_path
+    if self._vad is not None:
+       ^^^^^^^^^
+AttributeError: 'STTGstWhisper' object has no attribute '_vad'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 sttvad.py - Voice Activity Detection for IBus STT Whisper backend
 
