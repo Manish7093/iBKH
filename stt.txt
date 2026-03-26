@@ -1,4 +1,466 @@
 import logging
+import threading
+import queue
+import os
+import numpy as np
+
+from pathlib import Path
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttwhispermodel import STTWhisperModel
+
+LOG_MSG = logging.getLogger()
+
+try:
+    from pywhispercpp.model import Model
+    WHISPER_AVAILABLE = True
+except ImportError:
+    LOG_MSG.warning("pywhispercpp not available. Install with: pip install pywhispercpp")
+    WHISPER_AVAILABLE = False
+
+# --- Streaming constants derived from whisper_stream C++ example ---
+
+# Matches whisper_stream: window_samples = 5 * WHISPER_SAMPLE_RATE
+# Use a sliding window of the last N seconds instead of clearing the buffer.
+WINDOW_SECONDS      = 5.0
+
+# Matches whisper_stream: minimum 1024 samples before attempting inference.
+# Sample-count gate is more reliable than a duration gate because it is
+# independent of clock drift and partial-chunk arrival.
+MIN_SAMPLES         = 1024
+
+SAMPLE_RATE         = 16000
+
+# Partial encoder context — mirrors audio_ctx = 768 in whisper_stream.
+# Roughly halves encoder time with minimal accuracy loss during streaming.
+# Set to 0 to restore full 1500-frame context.
+AUDIO_CTX           = 768
+
+# Matches temperature_inc = -1.0f in whisper_stream.
+# Disables the temperature fallback that Whisper uses when greedy decoding
+# produces uncertain results.  In a streaming context that fallback adds
+# latency and produces hallucinations on silence / background noise.
+TEMPERATURE_INC     = -1.0
+
+# max_tokens = 32 in whisper_stream — keeps segment outputs short and
+# prevents the model from "filling in" long fabricated passages on noise.
+MAX_TOKENS          = 32
+
+# Thread count: min(8, os.cpu_count()) — mirrors whisper_stream's
+#   wparams.n_threads = std::min(N_THREAD, std::thread::hardware_concurrency())
+_cpu_count = os.cpu_count() or 1
+N_THREADS           = min(8, _cpu_count)
+
+
+class STTGstWhisper(STTGstBase):
+    __gtype_name__ = 'STTGstWhisper'
+
+    _pipeline_def = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "webrtcdsp noise-suppression-level=3 echo-cancel=false ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+    _pipeline_def_alt = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("WhisperSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id  = 0
+        self._model     = None
+        self._whisper   = None
+        self._set_model()
+
+        # --- Sliding ring buffer (mirrors whisper_stream window logic) ---
+        # We keep the last WINDOW_SECONDS * SAMPLE_RATE samples in a ring
+        # rather than clearing on every dispatch.  New chunks are appended;
+        # when the buffer exceeds the window size the head is trimmed.
+        self._ring_buffer     = np.array([], dtype=np.float32)
+        self._ring_lock       = threading.Lock()
+        # Accumulator for raw int16 chunks arriving from GStreamer.
+        # Flushed into the ring buffer inside _process_audio_buffer().
+        self._chunk_buffer    = []
+        self._chunk_samples   = 0   # sample count in _chunk_buffer
+
+        self._process_queue   = queue.Queue()
+        self._process_thread  = None
+        self._stop_processing = False
+
+        self._use_partial_results = False
+
+        LOG_MSG.info(
+            "STTGstWhisper init: n_threads=%d  audio_ctx=%d  "
+            "window=%.1fs  min_samples=%d  temperature_inc=%.1f",
+            N_THREADS, AUDIO_CTX, WINDOW_SECONDS, MIN_SAMPLES, TEMPERATURE_INC,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def __del__(self):
+        LOG_MSG.info("Whisper __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._appsink = None
+        self._whisper = None
+        LOG_MSG.info("Whisper.destroy() called")
+        super().destroy()
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    def _build_lang_code(self):
+        """
+        Return the two-letter BCP-47 language tag for the current locale,
+        or None to let Whisper auto-detect.
+
+        Mirrors whisper_stream:
+            wparams.language = is_multilingual ? lang.c_str() : "en"
+        """
+        if not self._current_locale or not self._current_locale.locale:
+            return None
+        code = self._current_locale.locale[:2].lower()
+        return code if code.isalpha() else None
+
+    def _load_whisper_model(self, model_path):
+        """Load or reload the Whisper model using pywhispercpp."""
+        if not WHISPER_AVAILABLE:
+            LOG_MSG.error("pywhispercpp not available")
+            return False
+
+        try:
+            LOG_MSG.info("Loading Whisper model: %s", model_path)
+            lang_code = self._build_lang_code()
+
+            # Pass the streaming-optimised parameters at construction time.
+            # pywhispercpp forwards keyword arguments as whisper_full_params fields.
+            kwargs = dict(
+                print_realtime=False,
+                print_progress=False,
+                # Matches whisper_stream: single_segment = true
+                # Forces all output into one segment — avoids duplicated text
+                # across overlapping windows.
+                single_segment=True,
+                # Matches whisper_stream: no_context = true
+                # Each window is decoded independently; prevents context
+                # from a previous window contaminating the current one.
+                no_context=True,
+                # Partial encoder context (audio_ctx = 768 in whisper_stream).
+                audio_ctx=AUDIO_CTX,
+                # Disable temperature fallback (temperature_inc = -1.0 in whisper_stream).
+                temperature_inc=TEMPERATURE_INC,
+                # Cap tokens per segment — prevents filling silence with
+                # hallucinated text (max_tokens = 32 in whisper_stream).
+                max_tokens=MAX_TOKENS,
+                # Thread count matching std::min(N_THREAD, hw_concurrency).
+                n_threads=N_THREADS,
+            )
+
+            if lang_code:
+                kwargs["language"] = lang_code
+
+            self._whisper = Model(model_path, **kwargs)
+            LOG_MSG.info(
+                "Whisper model loaded (lang=%s  n_threads=%d  audio_ctx=%d)",
+                lang_code or "auto", N_THREADS, AUDIO_CTX,
+            )
+            return True
+
+        except Exception as e:
+            LOG_MSG.error("Failed to load Whisper model: %s", e)
+            self._whisper = None
+            return False
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info(
+                "model path does not exist (%s - %s)",
+                self._model.get_name() if self._model else "None",
+                self._model.get_path() if self._model else "None",
+            )
+            self._whisper = None
+            self.emit("model-changed")
+            return
+
+        new_model_path = self._model.get_path()
+        LOG_MSG.debug("model ready %s", new_model_path)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        success = self._load_whisper_model(new_model_path)
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
+
+        if success:
+            self.emit("model-changed")
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if (self._model is not None and
+                self._model.get_locale() == self._current_locale.locale):
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._model    = STTWhisperModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    # ------------------------------------------------------------------
+    # Audio ingestion — GStreamer appsink callback
+    # ------------------------------------------------------------------
+
+    def _on_new_sample(self, appsink):
+        """Accumulate raw int16 samples and trigger processing when ready."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_int16 = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        self._chunk_buffer.append(audio_int16)
+        self._chunk_samples += len(audio_int16)
+
+        # Trigger processing once we have enough samples.
+        # Using a sample-count gate (matching whisper_stream's 1024-sample
+        # minimum) rather than a duration gate is more reliable: it is
+        # independent of clock drift and partial-chunk edge cases.
+        window_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+        if self._chunk_samples >= window_samples:
+            self._flush_chunks_to_ring()
+            self._dispatch_to_worker()
+
+        return Gst.FlowReturn.OK
+
+    # ------------------------------------------------------------------
+    # Sliding ring buffer helpers
+    # ------------------------------------------------------------------
+
+    def _flush_chunks_to_ring(self):
+        """
+        Convert accumulated int16 chunks to float32 and merge them into the
+        ring buffer, keeping only the last WINDOW_SECONDS of audio.
+
+        Mirrors whisper_stream:
+            pcmf32 = std::vector<float>(
+                g_pcmf32.end() - std::min(g_pcmf32.size(), window_samples),
+                g_pcmf32.end()
+            );
+            g_pcmf32.clear();
+        """
+        if not self._chunk_buffer:
+            return
+
+        new_samples = np.concatenate(self._chunk_buffer).astype(np.float32) / 32768.0
+        self._chunk_buffer.clear()
+        self._chunk_samples = 0
+
+        max_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+        with self._ring_lock:
+            self._ring_buffer = np.concatenate([self._ring_buffer, new_samples])
+            if len(self._ring_buffer) > max_samples:
+                self._ring_buffer = self._ring_buffer[-max_samples:]
+
+    def _dispatch_to_worker(self):
+        """
+        Snapshot the current ring buffer and post it to the worker thread.
+
+        Only dispatches if we have at least MIN_SAMPLES (1024) samples,
+        matching whisper_stream:
+            if (g_pcmf32.size() < 1024) { ... continue; }
+        """
+        with self._ring_lock:
+            if len(self._ring_buffer) < MIN_SAMPLES:
+                LOG_MSG.debug(
+                    "Ring buffer too small (%d samples < %d), skipping",
+                    len(self._ring_buffer), MIN_SAMPLES,
+                )
+                return
+            snapshot = self._ring_buffer.copy()
+
+        self._process_queue.put(snapshot)
+
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(
+                target=self._process_worker, daemon=True
+            )
+            self._process_thread.start()
+
+    # ------------------------------------------------------------------
+    # Inference worker
+    # ------------------------------------------------------------------
+
+    def _process_worker(self):
+        """
+        Background thread: pulls audio snapshots from the queue and runs
+        Whisper inference.
+
+        Only the last segment's text is used, matching whisper_stream:
+            const int n_segments = whisper_full_n_segments(ctx);
+            if (n_segments > 0) {
+                const char * text = whisper_full_get_segment_text(ctx, n_segments - 1);
+            }
+
+        Because we set single_segment=True the model should always return
+        exactly one segment, but we guard against edge cases.
+        """
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._whisper is None:
+                self._process_queue.task_done()
+                continue
+
+            try:
+                LOG_MSG.debug(
+                    "Starting transcription: %d samples (%.2f s)",
+                    len(audio), len(audio) / SAMPLE_RATE,
+                )
+
+                segments = self._whisper.transcribe(audio)
+
+                # Use only the last segment — mirrors whisper_stream which
+                # reads segment index (n_segments - 1).  With single_segment=True
+                # this is almost always the only element.
+                segments_list = list(segments)
+                if segments_list:
+                    last_seg  = segments_list[-1]
+                    text      = last_seg.text.strip() if hasattr(last_seg, "text") else ""
+                else:
+                    text = ""
+
+                if text:
+                    LOG_MSG.info("Whisper result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed")
+
+            except Exception as e:
+                LOG_MSG.error("Whisper transcription error: %s", e, exc_info=True)
+
+            self._process_queue.task_done()
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False
+
+    # ------------------------------------------------------------------
+    # Public API (STTGstBase interface)
+    # ------------------------------------------------------------------
+
+    def get_final_results(self):
+        """
+        Flush remaining accumulated chunks, dispatch one last inference,
+        then wait for the worker to finish.
+        """
+        self._flush_chunks_to_ring()
+        self._dispatch_to_worker()
+        self._process_queue.join()
+
+    def get_results(self):
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import logging
 import numpy as np
 from collections import deque
 
