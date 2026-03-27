@@ -16,6 +16,745 @@ GStreamer appsink
                               (streaming-optimised params)
                                         │
                                         ▼
+                           hallucination filter (blocklist)
+                                        │
+                                        ▼
+                              GLib.idle_add → emit("text", …)
+
+Streaming parameters derived from whisper.cpp stream example (active):
+  • audio_ctx       – 768 for .en models, 0 (full context) for multilingual.
+                      Multilingual models need the full 1500-frame encoder
+                      context to identify the language before decoding.
+  • no_context      = True  – independent windows, no KV-cache or token bleed.
+                      Equivalent to the unavailable condition_on_previous_text=False;
+                      breaks hallucination cascades ("thank you × 20").
+  • temperature_inc = -1.0  – disable temperature fallback (no hallucinations on silence)
+  • single_segment  = True  – one output segment per window
+  • max_tokens      = 32    – cap output length on silence/noise
+  • n_threads       = min(8, cpu_count)
+
+Note — condition_on_previous_text and beam_size are NOT exposed as
+constructor kwargs in the installed pywhispercpp version.  no_context=True
+covers the same anti-cascade effect.  The hallucination blocklist in
+_process_worker catches any remaining leakage.
+"""
+
+import logging
+import threading
+import queue
+import os
+import numpy as np
+
+from pathlib import Path
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttwhispermodel import STTWhisperModel
+
+LOG_MSG = logging.getLogger()
+
+# ---------------------------------------------------------------------------
+# Optional dependencies
+# ---------------------------------------------------------------------------
+
+try:
+    from pywhispercpp.model import Model
+    WHISPER_AVAILABLE = True
+except ImportError:
+    LOG_MSG.warning(
+        "pywhispercpp not available. Install with: pip install pywhispercpp"
+    )
+    WHISPER_AVAILABLE = False
+
+try:
+    from sttvad import STTVad
+    VAD_MODULE_OK = True
+except ImportError:
+    LOG_MSG.warning("sttvad module not found – VAD disabled")
+    VAD_MODULE_OK = False
+
+# ---------------------------------------------------------------------------
+# Streaming constants (derived from whisper_stream C++ example)
+# ---------------------------------------------------------------------------
+
+SAMPLE_RATE = 16000
+
+# Ring-buffer fallback window.
+# Matches whisper_stream: window_samples = 5 * WHISPER_SAMPLE_RATE
+WINDOW_SECONDS = 5.0
+
+# Minimum samples before submitting to inference.
+# Matches whisper_stream: if (g_pcmf32.size() < 1024) { ... continue; }
+MIN_SAMPLES = 1024
+
+# Partial encoder context for English-only (.en) models.
+# Matches whisper_stream: wparams.audio_ctx = 768
+# Set to 0 for multilingual models (see _audio_ctx_for_model below).
+AUDIO_CTX_EN = 768
+
+# Full encoder context for multilingual models.
+# Multilingual models use the full 1500-frame context to identify the
+# language before decoding.  Cutting it to 768 degrades language ID,
+# causing wrong-language output or silence hallucinations on non-English
+# locales (e.g. Hindi, Chinese, Russian).
+AUDIO_CTX_MULTILINGUAL = 0  # 0 = use model default (1500 frames)
+
+# Disable temperature fallback.
+# Matches whisper_stream: wparams.temperature_inc = -1.0f
+TEMPERATURE_INC = -1.0
+
+# Maximum tokens per segment.
+# Matches whisper_stream: wparams.max_tokens = 32
+MAX_TOKENS = 32
+
+# Thread count.
+# Matches whisper_stream: wparams.n_threads = std::min(N_THREAD, hw_concurrency)
+N_THREADS = min(8, os.cpu_count() or 1)
+
+# ---------------------------------------------------------------------------
+# Hallucination blocklist
+# ---------------------------------------------------------------------------
+# Whisper hallucinates the same phrases repeatedly during silence because it
+# was trained on ~680 K hours of YouTube audio.  Each language version
+# produces its own YouTube-outro phrases.
+#
+# Strategy (from Vexa production / Reddit thread):
+#   1. VAD pre-gate (primary defence — silence never reaches Whisper).
+#   2. no_context=True (covers condition_on_previous_text=False; stops cascade).
+#   3. temperature_inc=-1.0 (disables fallback retry on uncertain output).
+#   4. Exact-string blocklist below (last resort; case-insensitive).
+#
+# Sources: https://github.com/Vexa-ai/vexa (hallucinations/en.txt)
+#          https://github.com/openai/whisper/discussions/928
+
+_HALLUCINATION_BLOCKLIST = frozenset({
+    # English — YouTube outros
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for watching!",
+    "thank you for watching.",
+    "thank you so much for joining us",
+    "please subscribe",
+    "like and subscribe",
+    "don't forget to subscribe",
+    "subtitles by the amara.org community",
+    "subtitles by amara.org community",
+
+    # Hindi — YouTube outros (हिन्दी)
+    "धन्यवाद",
+    "देखने के लिए धन्यवाद",
+    "वीडियो देखने के लिए धन्यवाद",
+    "चैनल को सब्सक्राइब करें",
+    "लाइक और सब्सक्राइब करें",
+
+    # Russian
+    "субтитры сделал dimatorzok",
+
+    # Chinese
+    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+
+    # Turkish
+    "altyazı m.k",
+
+    # French
+    "sous-titres réalisés para la communauté d'amara.org",
+
+    # Finnish
+    "kiitos kun katsoit videon",
+
+    # Japanese
+    "ご視聴をありがとうございました",
+    "ご視聴ありがとうございます",
+})
+
+
+def _is_hallucination(text: str) -> bool:
+    """
+    Return True if text is a known hallucination phrase.
+
+    Uses case-insensitive, strip-normalised exact match.  Partial/substring
+    matching is intentionally avoided to prevent false positives on real speech
+    that happens to contain a common word from the blocklist.
+    """
+    return text.strip().lower() in _HALLUCINATION_BLOCKLIST
+
+
+# ---------------------------------------------------------------------------
+# Helper: determine audio_ctx from model path
+# ---------------------------------------------------------------------------
+
+def _audio_ctx_for_model(model_path: str) -> int:
+    """
+    Return the appropriate audio_ctx value for this model file.
+
+    English-only models end in '.en.bin' (e.g. ggml-base.en.bin).
+    They have a fixed language so the encoder can safely use a shorter
+    context (768 frames) for faster streaming.
+
+    Multilingual models (e.g. ggml-base.bin, ggml-large-v3.bin) must
+    use the full encoder context (0 = model default, 1500 frames) so
+    the language-identification attention has enough signal to work.
+    Setting audio_ctx=768 on a multilingual model degrades language ID
+    and significantly increases hallucinations on non-English locales.
+    """
+    name = Path(model_path).name.lower()
+    # Match e.g. "ggml-base.en.bin", "ggml-small.en.bin"
+    if name.endswith(".en.bin") or ".en." in name:
+        LOG_MSG.debug("English-only model detected — audio_ctx=%d", AUDIO_CTX_EN)
+        return AUDIO_CTX_EN
+    LOG_MSG.debug("Multilingual model detected — audio_ctx=%d (full context)", AUDIO_CTX_MULTILINGUAL)
+    return AUDIO_CTX_MULTILINGUAL
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class STTGstWhisper(STTGstBase):
+    __gtype_name__ = 'STTGstWhisper'
+
+    # With webrtcdsp noise suppression (preferred when plugin is present)
+    _pipeline_def = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "webrtcdsp noise-suppression-level=3 echo-cancel=false ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+
+    # Without webrtcdsp (fallback when plugin is absent)
+    _pipeline_def_alt = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("WhisperSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model    = None
+        self._whisper  = None
+        self._set_model()
+
+        # ------------------------------------------------------------------
+        # Voice Activity Detection
+        # ------------------------------------------------------------------
+        # When _vad is not None (Silero or energy-fallback VAD):
+        #   • _on_new_sample converts to float32 and calls _vad.process().
+        #   • Completed speech segments are queued directly for inference.
+        #   • The sliding ring buffer is NOT used.
+        #
+        # When _vad is None (sttvad import failed):
+        #   • Raw int16 chunks accumulate in _chunk_buffer.
+        #   • When _chunk_samples reaches a full window the chunks are merged
+        #     into the ring buffer and a snapshot is posted to the worker.
+        # ------------------------------------------------------------------
+        if VAD_MODULE_OK:
+            self._vad = STTVad(
+                speech_threshold=0.5,        # Silero confidence gate
+                silence_duration_ms=600,     # 600 ms silence → utterance end
+                speech_pad_ms=200,           # 200 ms pre-speech padding
+                min_speech_duration_ms=300,  # discard clicks / noise < 300 ms
+                max_speech_duration_s=30.0,  # force-flush after 30 s
+            )
+            LOG_MSG.info("VAD active: %s", self._vad.backend_name)
+        else:
+            self._vad = None
+            LOG_MSG.warning("VAD not available – using sliding ring-buffer fallback")
+
+        # ------------------------------------------------------------------
+        # Sliding ring buffer (fallback path only)
+        # ------------------------------------------------------------------
+        self._chunk_buffer  = []
+        self._chunk_samples = 0
+        self._ring_buffer   = np.empty(0, dtype=np.float32)
+        self._ring_lock     = threading.Lock()
+
+        # ------------------------------------------------------------------
+        # Transcription worker
+        # ------------------------------------------------------------------
+        self._process_queue   = queue.Queue()
+        self._process_thread  = None
+        self._stop_processing = False
+
+        self._use_partial_results = False
+
+        LOG_MSG.info(
+            "STTGstWhisper ready | vad=%s | n_threads=%d | "
+            "window=%.1fs | min_samples=%d | temperature_inc=%.1f",
+            self._vad.backend_name if self._vad else "disabled",
+            N_THREADS, WINDOW_SECONDS, MIN_SAMPLES, TEMPERATURE_INC,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def __del__(self):
+        LOG_MSG.info("Whisper __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._appsink = None
+        self._whisper = None
+        self._vad     = None
+
+        LOG_MSG.info("Whisper.destroy() called")
+        super().destroy()
+
+    # ------------------------------------------------------------------
+    # Model management
+    # ------------------------------------------------------------------
+
+    def _build_lang_code(self):
+        """
+        Return the two-letter BCP-47 language tag for the current locale,
+        or None to let Whisper auto-detect (multilingual models only).
+
+        Mirrors whisper_stream:
+            wparams.language = is_multilingual ? lang.c_str() : "en"
+        """
+        if not self._current_locale or not self._current_locale.locale:
+            return None
+        code = self._current_locale.locale[:2].lower()
+        return code if code.isalpha() else None
+
+    def _load_whisper_model(self, model_path):
+        """
+        Load (or reload) the Whisper model with streaming-optimised parameters.
+
+        Key multilingual fixes applied here
+        ------------------------------------
+        audio_ctx
+            English-only (.en) models → 768 (partial context, faster).
+            Multilingual models       → 0 / full 1500 frames.
+            Setting 768 on a multilingual model truncates the language-ID
+            attention, causing wrong-language output and silence hallucinations
+            on non-English locales (observed in Hindi, confirmed for other
+            languages in Vexa production data).
+
+        no_context=True
+            pywhispercpp equivalent of condition_on_previous_text=False.
+            Both prevent previous output from influencing the current decode
+            window — no_context also clears the KV cache so there is zero
+            bleed from the prior segment.  cascade hallucinations ("thank
+            you... thank you... thank you...") are broken at this layer.
+
+        NOTE — condition_on_previous_text and beam_size are NOT exposed as
+        constructor kwargs in pywhispercpp (the underlying whisper_full_params
+        C struct field is not mapped).  no_context=True covers the same
+        anti-cascade effect.  The hallucination blocklist in _process_worker
+        catches any remaining leakage.
+        """
+        if not WHISPER_AVAILABLE:
+            LOG_MSG.error("pywhispercpp not available")
+            return False
+
+        try:
+            LOG_MSG.info("Loading Whisper model: %s", model_path)
+            lang_code = self._build_lang_code()
+            audio_ctx = _audio_ctx_for_model(model_path)
+
+            kwargs = dict(
+                print_realtime=False,
+                print_progress=False,
+
+                # wparams.single_segment = true
+                # All output goes into one segment; prevents duplicated text
+                # across overlapping windows in the ring-buffer fallback.
+                single_segment=True,
+
+                # wparams.no_context = true
+                # Each window decoded independently; no token bleed from the
+                # previous window.  Covers the same ground as the unsupported
+                # condition_on_previous_text=False — and also clears the KV cache.
+                no_context=True,
+
+                # wparams.audio_ctx — see docstring above
+                audio_ctx=audio_ctx,
+
+                # wparams.temperature_inc = -1.0f
+                # Disables temperature-fallback retry; prevents hallucinations
+                # on silence / background noise.
+                temperature_inc=TEMPERATURE_INC,
+
+                # wparams.max_tokens = 32
+                # Caps output length; prevents long fabricated passages on noise.
+                max_tokens=MAX_TOKENS,
+
+                # wparams.n_threads = std::min(N_THREAD, hw_concurrency)
+                n_threads=N_THREADS,
+            )
+
+            if lang_code:
+                kwargs["language"] = lang_code
+
+            self._whisper = Model(model_path, **kwargs)
+            LOG_MSG.info(
+                "Whisper model loaded | lang=%s | n_threads=%d | audio_ctx=%d | "
+                "no_context=True | temperature_inc=%.1f",
+                lang_code or "auto", N_THREADS, audio_ctx, TEMPERATURE_INC,
+            )
+            return True
+
+        except Exception as e:
+            LOG_MSG.error("Failed to load Whisper model: %s", e)
+            self._whisper = None
+            return False
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info(
+                "model path does not exist (%s - %s)",
+                self._model.get_name() if self._model else "None",
+                self._model.get_path() if self._model else "None",
+            )
+            self._whisper = None
+            self.emit("model-changed")
+            return
+
+        new_model_path = self._model.get_path()
+        LOG_MSG.debug("model ready %s", new_model_path)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        success = self._load_whisper_model(new_model_path)
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
+
+        if success:
+            # Reset VAD so stale audio from the previous model does not
+            # contaminate the first transcriptions of the new one.
+            if self._vad is not None:
+                self._vad.reset()
+            self.emit("model-changed")
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if (
+            self._model is not None
+            and self._model.get_locale() == self._current_locale.locale
+        ):
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._model    = STTWhisperModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    # ------------------------------------------------------------------
+    # GStreamer appsink callback
+    # ------------------------------------------------------------------
+
+    def _on_new_sample(self, appsink):
+        """
+        Called from the GStreamer streaming thread for every audio buffer.
+
+        Converts S16LE → float32 once, then routes to:
+
+        VAD path (preferred)
+        --------------------
+        STTVad.process() classifies each 512-sample chunk.  Completed speech
+        segments are queued for inference.  Silence is discarded — Whisper
+        never sees it, which is the primary hallucination defence.
+
+        Ring-buffer fallback (VAD unavailable)
+        ----------------------------------------
+        Accumulates int16 chunks.  When a full window accumulates, chunks are
+        converted to float32, merged into a sliding ring buffer (last
+        WINDOW_SECONDS of audio), and a snapshot is posted to the worker if
+        it contains at least MIN_SAMPLES samples.
+        """
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_int16 = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        # S16LE → float32 normalised to [-1, +1]
+        audio_float = audio_int16.astype(np.float32) / 32768.0
+
+        if self._vad is not None:
+            # ── VAD path ──────────────────────────────────────────────
+            segments = self._vad.process(audio_float)
+            for segment in segments:
+                LOG_MSG.debug(
+                    "VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE
+                )
+                self._enqueue_for_transcription(segment)
+        else:
+            # ── Sliding ring-buffer fallback ───────────────────────────
+            self._chunk_buffer.append(audio_int16)
+            self._chunk_samples += len(audio_int16)
+
+            window_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+            if self._chunk_samples >= window_samples:
+                self._flush_chunks_to_ring()
+                self._dispatch_ring_snapshot()
+
+        return Gst.FlowReturn.OK
+
+    # ------------------------------------------------------------------
+    # Ring-buffer helpers (fallback path only)
+    # ------------------------------------------------------------------
+
+    def _flush_chunks_to_ring(self):
+        """
+        Convert accumulated int16 chunks to float32 and merge into the ring
+        buffer, keeping only the last WINDOW_SECONDS of audio.
+
+        Mirrors whisper_stream:
+            pcmf32 = vector<float>(
+                g_pcmf32.end() - min((int64_t)g_pcmf32.size(), window_samples),
+                g_pcmf32.end()
+            );
+            g_pcmf32.clear();
+        """
+        if not self._chunk_buffer:
+            return
+
+        new_samples = (
+            np.concatenate(self._chunk_buffer).astype(np.float32) / 32768.0
+        )
+        self._chunk_buffer.clear()
+        self._chunk_samples = 0
+
+        max_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+        with self._ring_lock:
+            self._ring_buffer = np.concatenate([self._ring_buffer, new_samples])
+            if len(self._ring_buffer) > max_samples:
+                self._ring_buffer = self._ring_buffer[-max_samples:]
+
+    def _dispatch_ring_snapshot(self):
+        """
+        Snapshot the ring buffer and post it to the transcription worker.
+
+        Guards against submitting too little audio — mirrors whisper_stream:
+            if (g_pcmf32.size() < 1024) { sleep_for(10ms); continue; }
+        """
+        with self._ring_lock:
+            if len(self._ring_buffer) < MIN_SAMPLES:
+                LOG_MSG.debug(
+                    "Ring buffer too small (%d samples < %d), skipping dispatch",
+                    len(self._ring_buffer), MIN_SAMPLES,
+                )
+                return
+            snapshot = self._ring_buffer.copy()
+
+        self._enqueue_for_transcription(snapshot)
+
+    # ------------------------------------------------------------------
+    # Transcription worker
+    # ------------------------------------------------------------------
+
+    def _enqueue_for_transcription(self, audio_float32: np.ndarray):
+        """Queue a float32 audio segment and ensure the worker thread is live."""
+        self._process_queue.put(audio_float32)
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(
+                target=self._process_worker, daemon=True
+            )
+            self._process_thread.start()
+
+    def _process_worker(self):
+        """
+        Background thread: dequeues float32 audio and runs Whisper inference.
+
+        Uses last-segment-only output (mirrors whisper_stream reading segment
+        index n_segments-1).  With single_segment=True this is always the only
+        element; the guard handles edge cases.
+
+        Output is filtered through the hallucination blocklist before emitting.
+        The blocklist is a last resort — VAD + no_context=True +
+        temperature_inc=-1.0 should handle the vast majority of hallucinations
+        before text even reaches this point.
+        """
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._whisper is None:
+                LOG_MSG.debug("No model loaded, skipping transcription")
+                self._process_queue.task_done()
+                continue
+
+            try:
+                LOG_MSG.debug(
+                    "Transcribing %d samples (%.2f s)",
+                    len(audio), len(audio) / SAMPLE_RATE,
+                )
+
+                segments = self._whisper.transcribe(audio)
+
+                # Use only the last segment (mirrors whisper_stream).
+                segments_list = list(segments)
+                if segments_list:
+                    last_seg = segments_list[-1]
+                    text = last_seg.text.strip() if hasattr(last_seg, "text") else ""
+                else:
+                    text = ""
+
+                if not text:
+                    LOG_MSG.debug("No text transcribed from segment")
+                    self._process_queue.task_done()
+                    continue
+
+                # Hallucination blocklist filter (last resort layer).
+                if _is_hallucination(text):
+                    LOG_MSG.debug("Blocked hallucination: '%s'", text)
+                    self._process_queue.task_done()
+                    continue
+
+                LOG_MSG.info("Whisper result: '%s'", text)
+                GLib.idle_add(self._emit_text, text)
+
+            except Exception as exc:
+                LOG_MSG.error("Whisper transcription error: %s", exc, exc_info=True)
+
+            self._process_queue.task_done()
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False  # Remove from GLib idle source after one call
+
+    # ------------------------------------------------------------------
+    # Public interface (STTGstBase)
+    # ------------------------------------------------------------------
+
+    def get_final_results(self):
+        """
+        Flush any buffered audio and wait for the transcription queue to drain.
+
+        VAD path: STTVad.flush() returns any in-progress speech not yet at the
+        silence threshold (e.g. user stopped mid-sentence).
+
+        Ring-buffer fallback: remaining chunks flushed to ring and dispatched.
+        """
+        if self._vad is not None:
+            remaining = self._vad.flush()
+            if remaining is not None:
+                LOG_MSG.debug(
+                    "VAD end-of-session flush: %.2f s",
+                    len(remaining) / SAMPLE_RATE,
+                )
+                self._enqueue_for_transcription(remaining)
+        else:
+            self._flush_chunks_to_ring()
+            self._dispatch_ring_snapshot()
+
+        self._process_queue.join()
+
+    def get_results(self):
+        """Not used — VAD / ring buffer drive segment boundaries."""
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass  # Whisper does not expose n-best lists via pywhispercpp
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+
+
+
+
+
+
+
+
+"""
+sttgstwhisper.py — GStreamer/Whisper backend for IBus STT
+
+Audio path
+----------
+GStreamer appsink
+    │
+    ▼  S16LE @ 16 kHz
+    ├── [VAD available] ──► STTVad.process() ──► completed speech segments
+    │                                                    │
+    └── [VAD unavailable] ─► sliding ring buffer ────────┘
+                             (5 s window, 1024-sample gate)
+                                        │
+                                        ▼
+                              pywhispercpp inference
+                              (streaming-optimised params)
+                                        │
+                                        ▼
                               GLib.idle_add → emit("text", …)
 
 Streaming parameters are derived from the whisper.cpp stream example
