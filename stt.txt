@@ -1,3 +1,992 @@
+-----sttgstwhisper------
+
+"""
+sttgstwhisper.py \u2014 GStreamer/Whisper backend for IBus STT
+
+Audio path
+----------
+GStreamer appsink
+    \u2502
+    \u25bc  S16LE @ 16 kHz
+    \u251c\u2500\u2500 [VAD available] \u2500\u2500\u25ba STTVad.process() \u2500\u2500\u25ba completed speech segments
+    \u2502                                                    \u2502
+    \u2514\u2500\u2500 [VAD unavailable] \u2500\u25ba sliding ring buffer \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518
+                             (5 s window, 1024-sample gate)
+                                        \u2502
+                                        \u25bc
+                              pywhispercpp inference
+                              (streaming-optimised params)
+                                        \u2502
+                                        \u25bc
+                              GLib.idle_add \u2192 emit("text", \u2026)
+
+Streaming parameters are derived from the whisper.cpp stream example
+(examples/stream/stream.cpp):
+  \u2022 audio_ctx       = 768   \u2013 partial encoder context (~2� faster)
+  \u2022 temperature_inc = -1.0  \u2013 disable temperature fallback (no hallucinations)
+  \u2022 single_segment  = True  \u2013 one output segment per window (no drift)
+  \u2022 no_context      = True  \u2013 independent windows (no bleed from previous)
+  \u2022 max_tokens      = 32    \u2013 cap output length on silence/noise
+  \u2022 n_threads       = min(8, cpu_count)
+"""
+
+import logging
+import threading
+import queue
+import os
+import numpy as np
+
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttwhispermodel import STTWhisperModel
+
+LOG_MSG = logging.getLogger()
+
+# ---------------------------------------------------------------------------
+# Optional dependencies
+# ---------------------------------------------------------------------------
+
+try:
+    from pywhispercpp.model import Model
+    WHISPER_AVAILABLE = True
+except ImportError:
+    LOG_MSG.warning(
+        "pywhispercpp not available. Install with: pip install pywhispercpp"
+    )
+    WHISPER_AVAILABLE = False
+
+try:
+    from sttvad import STTVad
+    VAD_MODULE_OK = True
+except ImportError:
+    LOG_MSG.warning("sttvad module not found \u2013 VAD disabled")
+    VAD_MODULE_OK = False
+
+# ---------------------------------------------------------------------------
+# Module-level streaming constants (derived from whisper_stream C++ example)
+# ---------------------------------------------------------------------------
+
+SAMPLE_RATE = 16000
+
+# Sliding window length used by the ring-buffer fallback.
+# Matches whisper_stream: window_samples = 5 * WHISPER_SAMPLE_RATE
+WINDOW_SECONDS = 5.0
+
+# Minimum samples before submitting to inference.
+# Matches whisper_stream: if (g_pcmf32.size() < 1024) { ... continue; }
+# A sample-count gate is more reliable than a duration gate: it is
+# independent of clock drift and partial-chunk arrival timing.
+MIN_SAMPLES = 1024
+
+# Partial encoder context.
+# Matches whisper_stream: wparams.audio_ctx = 768  // partial encoder context
+# Roughly halves encoder time with negligible accuracy loss during streaming.
+# Set to 0 to restore the full 1500-frame context.
+AUDIO_CTX = 768
+
+# Disable temperature fallback.
+# Matches whisper_stream: wparams.temperature_inc = -1.0f
+# The fallback retries decoding at higher temperatures when the model is
+# uncertain; in a streaming context it adds latency and produces hallucinated
+# text on silence / background noise.
+TEMPERATURE_INC = -1.0
+
+# Maximum tokens per segment.
+# Matches whisper_stream: wparams.max_tokens = 32
+# Prevents the model from generating long fabricated passages on noise.
+MAX_TOKENS = 64
+
+# Thread count.
+# Matches whisper_stream: wparams.n_threads = std::min(N_THREAD, hw_concurrency)
+N_THREADS = min(8, os.cpu_count() or 1)
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class STTGstWhisper(STTGstBase):
+    __gtype_name__ = 'STTGstWhisper'
+
+    # With webrtcdsp noise suppression (preferred when plugin is present)
+    _pipeline_def = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "webrtcdsp noise-suppression-level=3 echo-cancel=false ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+
+    # Without webrtcdsp (fallback when plugin is absent)
+    _pipeline_def_alt = (
+        "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! "
+        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! "
+        "queue ! "
+        "appsink name=WhisperSink emit-signals=true sync=false"
+    )
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("WhisperSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model    = None
+        self._whisper  = None
+        self._vad = None
+        self._set_model()
+
+        # ------------------------------------------------------------------
+        # Voice Activity Detection
+        # ------------------------------------------------------------------
+        # When _vad is not None (Silero or energy-fallback VAD):
+        #   \u2022 _on_new_sample converts to float32 and calls _vad.process().
+        #   \u2022 Completed speech segments are queued directly for inference.
+        #   \u2022 The sliding ring buffer is NOT used.
+        #
+        # When _vad is None (sttvad import failed):
+        #   \u2022 Raw int16 chunks accumulate in _chunk_buffer.
+        #   \u2022 When _chunk_samples reaches a full window the chunks are merged
+        #     into the ring buffer and a snapshot is posted to the worker.
+        # ------------------------------------------------------------------
+        if VAD_MODULE_OK:
+            self._vad = STTVad(
+                speech_threshold=0.5,        # Silero confidence gate
+                silence_duration_ms=600,     # 600 ms silence \u2192 utterance end
+                speech_pad_ms=200,           # 200 ms pre-speech padding
+                min_speech_duration_ms=300,  # discard clicks / noise < 300 ms
+                max_speech_duration_s=30.0,  # force-flush after 30 s
+            )
+            LOG_MSG.info("VAD active: %s", self._vad.backend_name)
+        else:
+            self._vad = None
+            LOG_MSG.warning("VAD not available \u2013 using sliding ring-buffer fallback")
+
+        # ------------------------------------------------------------------
+        # Sliding ring buffer (fallback path only)
+        # ------------------------------------------------------------------
+        # Mirrors whisper_stream's ring buffer logic:
+        #   pcmf32 = vector<float>(g_pcmf32.end() - min(size, window_samples),
+        #                          g_pcmf32.end());
+        #   g_pcmf32.clear();
+        #
+        # _chunk_buffer  \u2013 raw int16 arrays from GStreamer, not yet converted.
+        # _chunk_samples \u2013 running sample count in _chunk_buffer.
+        # _ring_buffer   \u2013 float32 sliding window (last WINDOW_SECONDS kept).
+        # _ring_lock     \u2013 guards _ring_buffer across GStreamer + worker threads.
+        self._chunk_buffer  = []
+        self._chunk_samples = 0
+        self._ring_buffer   = np.empty(0, dtype=np.float32)
+        self._ring_lock     = threading.Lock()
+
+        # ------------------------------------------------------------------
+        # Transcription worker
+        # ------------------------------------------------------------------
+        self._process_queue   = queue.Queue()
+        self._process_thread  = None
+        self._stop_processing = False
+
+        self._use_partial_results = False
+
+        LOG_MSG.info(
+            "STTGstWhisper ready | vad=%s | n_threads=%d | audio_ctx=%d | "
+            "window=%.1fs | min_samples=%d | temperature_inc=%.1f",
+            self._vad.backend_name if self._vad else "disabled",
+            N_THREADS, AUDIO_CTX, WINDOW_SECONDS, MIN_SAMPLES, TEMPERATURE_INC,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def __del__(self):
+        LOG_MSG.info("Whisper __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._appsink = None
+        self._whisper = None
+        self._vad     = None
+
+        LOG_MSG.info("Whisper.destroy() called")
+        super().destroy()
+
+    # ------------------------------------------------------------------
+    # Model management
+    # ------------------------------------------------------------------
+
+    def _build_lang_code(self):
+        """
+        Return the two-letter BCP-47 language tag for the current locale,
+        or None to let Whisper auto-detect (multilingual models only).
+
+        Mirrors whisper_stream:
+            wparams.language = is_multilingual ? lang.c_str() : "en"
+        """
+        if not self._current_locale or not self._current_locale.locale:
+            return None
+        code = self._current_locale.locale[:2].lower()
+        return code if code.isalpha() else None
+
+    def _load_whisper_model(self, model_path):
+        """
+        Load (or reload) the Whisper model with streaming-optimised parameters.
+
+        All kwargs mirror the whisper_full_params set in whisper_stream.cpp.
+        pywhispercpp forwards them as fields on the underlying C struct.
+        """
+        if not WHISPER_AVAILABLE:
+            LOG_MSG.error("pywhispercpp not available")
+            return False
+
+        try:
+            LOG_MSG.info("Loading Whisper model: %s", model_path)
+            lang_code = self._build_lang_code()
+
+            kwargs = dict(
+                print_realtime=False,
+                print_progress=False,
+                # wparams.single_segment = true
+                # All output goes into one segment; prevents duplicated text
+                # across overlapping windows in the ring-buffer fallback path,
+                # and keeps VAD segment output clean.
+                single_segment=True,
+                # wparams.no_context = true
+                # Each window/segment is decoded independently; no token bleed
+                # from the previous window.
+                no_context=True,
+                # wparams.audio_ctx = 768  // partial encoder context
+                # Roughly halves encoder latency during streaming.
+                audio_ctx=AUDIO_CTX,
+                # wparams.temperature_inc = -1.0f
+                # Disables the temperature-fallback retry loop; prevents
+                # hallucinations on silence / background noise.
+                temperature_inc=TEMPERATURE_INC,
+                # wparams.max_tokens = 32
+                # Caps output length; prevents long fabricated passages on noise.
+                max_tokens=MAX_TOKENS,
+                # wparams.n_threads = std::min(N_THREAD, hw_concurrency)
+                n_threads=N_THREADS,
+                
+                
+                no_speech_thold = 0.6,
+                logprob_thold = -1.5,
+                entropy_thold = 2.8,
+            )
+
+            if lang_code:
+                kwargs["language"] = lang_code
+
+            self._whisper = Model(model_path, **kwargs)
+            LOG_MSG.info(
+                "Whisper model loaded (lang=%s  n_threads=%d  audio_ctx=%d)",
+                lang_code or "auto", N_THREADS, AUDIO_CTX,
+            )
+            return True
+
+        except Exception as e:
+            LOG_MSG.error("Failed to load Whisper model: %s", e)
+            self._whisper = None
+            return False
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info(
+                "model path does not exist (%s - %s)",
+                self._model.get_name() if self._model else "None",
+                self._model.get_path() if self._model else "None",
+            )
+            self._whisper = None
+            self.emit("model-changed")
+            return
+
+        new_model_path = self._model.get_path()
+        LOG_MSG.debug("model ready %s", new_model_path)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        success = self._load_whisper_model(new_model_path)
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
+
+        if success:
+            # Reset VAD state so stale audio from the previous model does not
+            # contaminate transcriptions produced by the new model.
+            if self._vad is not None:
+                self._vad.reset()
+            self.emit("model-changed")
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if (
+            self._model is not None
+            and self._model.get_locale() == self._current_locale.locale
+        ):
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._model    = STTWhisperModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    # ------------------------------------------------------------------
+    # GStreamer appsink callback
+    # ------------------------------------------------------------------
+
+    def _on_new_sample(self, appsink):
+        """
+        Called from the GStreamer streaming thread for every audio buffer.
+
+        Converts S16LE \u2192 float32 once and then routes to one of two paths:
+
+        VAD path (preferred)
+        --------------------
+        Passes float32 audio to STTVad.process().  The VAD classifies each
+        512-sample chunk internally and returns completed speech segments only.
+        Silence is discarded \u2014 the inference worker never sees it.
+
+        Ring-buffer fallback (VAD unavailable)
+        ----------------------------------------
+        Accumulates raw int16 chunks.  When _chunk_samples reaches a full
+        window (WINDOW_SECONDS � SAMPLE_RATE), the chunks are converted to
+        float32, merged into the sliding ring buffer (keeping the last
+        WINDOW_SECONDS of audio), and a snapshot is posted to the worker if
+        it contains at least MIN_SAMPLES samples.  This mirrors the sliding-
+        window logic in whisper_stream exactly.
+        """
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_int16 = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        # S16LE \u2192 float32 normalised to [-1, +1]
+        audio_float = audio_int16.astype(np.float32) / 32768.0
+
+        if self._vad is not None:
+            # \u2500\u2500 VAD path \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            # process() accumulates chunks internally and returns completed
+            # utterances only.  Nothing is enqueued during silence.
+            segments = self._vad.process(audio_float)
+            for segment in segments:
+                LOG_MSG.debug(
+                    "VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE
+                )
+                self._enqueue_for_transcription(segment)
+        else:
+            # \u2500\u2500 Sliding ring-buffer fallback \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            # Accumulate int16 until a full window is ready.
+            self._chunk_buffer.append(audio_int16)
+            self._chunk_samples += len(audio_int16)
+
+            window_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+            if self._chunk_samples >= window_samples:
+                self._flush_chunks_to_ring()
+                self._dispatch_ring_snapshot()
+
+        return Gst.FlowReturn.OK
+
+    # ------------------------------------------------------------------
+    # Ring-buffer helpers (fallback path only)
+    # ------------------------------------------------------------------
+
+    def _flush_chunks_to_ring(self):
+        """
+        Convert accumulated int16 chunks to float32 and merge into the ring
+        buffer, keeping only the last WINDOW_SECONDS of audio.
+
+        Mirrors whisper_stream:
+            pcmf32 = vector<float>(
+                g_pcmf32.end() - min((int64_t)g_pcmf32.size(), window_samples),
+                g_pcmf32.end()
+            );
+            g_pcmf32.clear();
+        """
+        if not self._chunk_buffer:
+            return
+
+        new_samples = (
+            np.concatenate(self._chunk_buffer).astype(np.float32) / 32768.0
+        )
+        self._chunk_buffer.clear()
+        self._chunk_samples = 0
+
+        max_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+        with self._ring_lock:
+            self._ring_buffer = np.concatenate([self._ring_buffer, new_samples])
+            if len(self._ring_buffer) > max_samples:
+                # Keep only the tail \u2014 exactly as whisper_stream does.
+                self._ring_buffer = self._ring_buffer[-max_samples:]
+
+    def _dispatch_ring_snapshot(self):
+        """
+        Snapshot the ring buffer and post it to the transcription worker.
+
+        Guards against submitting too little audio \u2014 mirrors whisper_stream:
+            if (g_pcmf32.size() < 1024) { sleep_for(10ms); continue; }
+        """
+        with self._ring_lock:
+            if len(self._ring_buffer) < MIN_SAMPLES:
+                LOG_MSG.debug(
+                    "Ring buffer too small (%d samples < %d), skipping dispatch",
+                    len(self._ring_buffer), MIN_SAMPLES,
+                )
+                return
+            snapshot = self._ring_buffer.copy()
+
+        self._enqueue_for_transcription(snapshot)
+
+    # ------------------------------------------------------------------
+    # Transcription worker
+    # ------------------------------------------------------------------
+
+    def _enqueue_for_transcription(self, audio_float32: np.ndarray):
+        """Queue a float32 audio segment and ensure the worker thread is live."""
+        self._process_queue.put(audio_float32)
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(
+                target=self._process_worker, daemon=True
+            )
+            self._process_thread.start()
+
+    def _process_worker(self):
+        """
+        Background thread: dequeues float32 audio segments and runs Whisper.
+
+        Only the last segment's text is used, mirroring whisper_stream:
+            const int n_segments = whisper_full_n_segments(ctx);
+            if (n_segments > 0)
+                text = whisper_full_get_segment_text(ctx, n_segments - 1);
+
+        With single_segment=True the model should always return exactly one
+        segment; the guard handles unexpected edge cases.
+
+        For the VAD path each item is a clean, silence-trimmed utterance.
+        For the ring-buffer fallback each item is the last 5 s of audio.
+        """
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._whisper is None:
+                LOG_MSG.debug("No model loaded, skipping transcription")
+                self._process_queue.task_done()
+                continue
+
+            try:
+                LOG_MSG.debug(
+                    "Transcribing %d samples (%.2f s)",
+                    len(audio), len(audio) / SAMPLE_RATE,
+                )
+
+                segments = self._whisper.transcribe(audio)
+
+                # Use only the last segment \u2014 mirrors whisper_stream reading
+                # segment index (n_segments - 1).
+                segments_list = list(segments)
+                if segments_list:
+                    last_seg = segments_list[-1]
+                    text = last_seg.text.strip() if hasattr(last_seg, "text") else ""
+                else:
+                    text = ""
+
+                if text:
+                    LOG_MSG.info("Whisper result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed from segment")
+
+            except Exception as exc:
+                LOG_MSG.error("Whisper transcription error: %s", exc, exc_info=True)
+
+            self._process_queue.task_done()
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False  # Remove from GLib idle source after one call
+
+    # ------------------------------------------------------------------
+    # Public interface (STTGstBase)
+    # ------------------------------------------------------------------
+
+    def get_final_results(self):
+        """
+        Flush any buffered audio and wait for the transcription queue to drain.
+
+        Called by _stop_real() so the last utterance is never silently dropped.
+
+        VAD path
+        --------
+        STTVad.flush() returns any in-progress speech that has not yet reached
+        the silence threshold (e.g. the user stopped mid-sentence).
+
+        Ring-buffer fallback
+        --------------------
+        Remaining chunks in _chunk_buffer are flushed to the ring and
+        dispatched with the same logic used during normal streaming.
+        """
+        if self._vad is not None:
+            remaining = self._vad.flush()
+            if remaining is not None:
+                LOG_MSG.debug(
+                    "VAD end-of-session flush: %.2f s",
+                    len(remaining) / SAMPLE_RATE,
+                )
+                self._enqueue_for_transcription(remaining)
+        else:
+            self._flush_chunks_to_ring()
+            self._dispatch_ring_snapshot()
+
+        # Block until every queued segment has been transcribed.
+        self._process_queue.join()
+
+    def get_results(self):
+        """Not used \u2014 VAD / ring buffer drive segment boundaries."""
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass  # Whisper does not expose n-best lists via pywhispercpp
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+------sttvad.py-----
+
+
+
+"""
+sttvad.py - Voice Activity Detection for IBus STT Whisper backend
+
+Uses Silero VAD (https://github.com/snakers4/silero-vad) when PyTorch is
+available, otherwise falls back to a simple RMS energy detector.
+
+Silero VAD install:
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    # Model weights (~1.8 MB) are downloaded automatically from GitHub on first use
+
+Energy fallback requires no extra dependencies.
+"""
+
+import logging
+import numpy as np
+from collections import deque
+
+LOG_MSG = logging.getLogger()
+
+# ---------------------------------------------------------------------------
+# One-time Silero VAD model load
+# ---------------------------------------------------------------------------
+_SILERO_MODEL = None
+_SILERO_AVAILABLE = False
+
+
+def _try_load_silero():
+    global _SILERO_MODEL, _SILERO_AVAILABLE
+    try:
+        import torch  # noqa: F401 \u2013 checked at runtime
+
+        # hub.load downloads weights to ~/.cache/torch/hub on first run
+        _SILERO_MODEL, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=False,
+            verbose=False,
+        )
+        _SILERO_MODEL.eval()
+        _SILERO_AVAILABLE = True
+        LOG_MSG.info("Silero VAD loaded successfully")
+    except Exception as exc:
+        LOG_MSG.warning(
+            "Silero VAD not available (%s). "
+            "Install PyTorch for better VAD accuracy. "
+            "Falling back to energy-based VAD.",
+            exc,
+        )
+        _SILERO_AVAILABLE = False
+
+
+_try_load_silero()
+
+
+# ---------------------------------------------------------------------------
+# Public VAD class
+# ---------------------------------------------------------------------------
+
+class STTVad:
+    """
+    Stream-oriented Voice Activity Detector.
+
+    Feed raw PCM float32 audio (16 kHz, mono) in arbitrary chunk sizes via
+    :meth:`process`.  Complete speech *segments* (numpy float32 arrays) are
+    returned whenever an utterance ends.  Call :meth:`flush` before stopping
+    to retrieve any incomplete final segment.
+
+    Parameters
+    ----------
+    speech_threshold : float
+        Silero confidence threshold in [0, 1].  Higher \u2192 less sensitive.
+        Typical good value: 0.5.
+    silence_duration_ms : int
+        Continuous silence (ms) required to mark the end of an utterance.
+        Shorter values give faster response but more split utterances.
+        Typical good value: 600 ms.
+    speech_pad_ms : int
+        Pre-speech padding (ms) included before the detected speech onset.
+        Prevents clipping the first phoneme.  Typical: 200 ms.
+    min_speech_duration_ms : int
+        Segments shorter than this are discarded as noise.  Typical: 300 ms.
+    max_speech_duration_s : float
+        Force-flush a segment if it grows beyond this length so Whisper does
+        not receive excessively long audio.  Typical: 30 s.
+    """
+
+    # Silero VAD requires exactly 512 samples per inference call at 16 kHz
+    # (= 32 ms per chunk).  512 is the only valid chunk size for 16 kHz in
+    # the standard silero_vad model.
+    _SILERO_CHUNK = 512
+    SAMPLE_RATE = 16000
+
+    def __init__(
+        self,
+        speech_threshold: float = 0.5,
+        silence_duration_ms: int =  600,#100, #600,
+        speech_pad_ms: int = 200,#30, #200,
+        min_speech_duration_ms: int = 300,#250, #300,
+        max_speech_duration_s: float = 30, #float('inf'),#30.0,
+    ):
+        self._threshold = speech_threshold
+
+        # Convert durations to samples
+        self._silence_samples = int(silence_duration_ms * self.SAMPLE_RATE / 1000)
+        self._pad_samples = int(speech_pad_ms * self.SAMPLE_RATE / 1000)
+        self._min_speech_samples = int(min_speech_duration_ms * self.SAMPLE_RATE / 1000)
+        self._max_speech_samples = int(max_speech_duration_s * self.SAMPLE_RATE)
+
+        # Determine VAD chunk size (Silero: 512, energy: 320 = 20 ms)
+        self._chunk_size = self._SILERO_CHUNK if _SILERO_AVAILABLE else 320
+
+        # Pre-speech ring buffer (holds up to _pad_samples worth of chunks)
+        pad_chunks = max(1, self._pad_samples // self._chunk_size)
+        self._pre_buf: deque = deque(maxlen=pad_chunks)
+
+        # Accumulator for incoming audio (may be less than one chunk)
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        # Speech accumulation
+        self._speech_chunks: list = []
+        self._speech_samples: int = 0
+
+        # State
+        self._in_speech: bool = False
+        self._silence_counter: int = 0  # samples counted since last speech chunk
+
+        if _SILERO_AVAILABLE:
+            import torch as _torch
+            self._torch = _torch
+            self._reset_silero_states()
+        else:
+            self._torch = None
+
+        LOG_MSG.info("STTVad ready \u2013 backend: %s", self.backend_name)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    @property
+    def is_silero(self) -> bool:
+        return _SILERO_AVAILABLE
+
+    @property
+    def backend_name(self) -> str:
+        return "Silero VAD" if _SILERO_AVAILABLE else "Energy-based VAD (fallback)"
+
+    def reset(self) -> None:
+        """Reset all internal state (call when starting a new recording session)."""
+        self._pre_buf.clear()
+        self._leftover = np.empty(0, dtype=np.float32)
+        self._speech_chunks = []
+        self._speech_samples = 0
+        self._in_speech = False
+        self._silence_counter = 0
+        if _SILERO_AVAILABLE:
+            self._reset_silero_states()
+
+    def process(self, audio: np.ndarray) -> list:
+        """
+        Feed incoming audio and return a list of completed speech segments.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Float32 PCM, 16 kHz, mono.  Any length is accepted.
+
+        Returns
+        -------
+        list of np.ndarray
+            Zero or more completed speech segments ready for transcription.
+        """
+        completed_segments = []
+
+        # Prepend any leftover samples from the previous call
+        if len(self._leftover):
+            audio = np.concatenate([self._leftover, audio])
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        offset = 0
+        while offset + self._chunk_size <= len(audio):
+            chunk = audio[offset: offset + self._chunk_size]
+            offset += self._chunk_size
+
+            is_speech, confidence = self._classify_chunk(chunk)
+
+            if is_speech:
+                self._on_speech_chunk(chunk, confidence, completed_segments)
+            else:
+                self._on_silence_chunk(chunk, completed_segments)
+
+        # Save incomplete tail for the next call
+        if offset < len(audio):
+            self._leftover = audio[offset:].copy()
+
+        return completed_segments
+
+    def flush(self) -> "np.ndarray | None":
+        """
+        Flush remaining buffered speech.
+
+        Call this when recording stops so the last utterance is not lost.
+
+        Returns
+        -------
+        np.ndarray or None
+            A speech segment, or *None* if the buffer was empty / too short.
+        """
+        segment = None
+        if self._in_speech and self._speech_samples >= self._min_speech_samples:
+            # Include any leftover sub-chunk audio
+            parts = list(self._speech_chunks)
+            if len(self._leftover):
+                parts.append(self._leftover)
+            segment = np.concatenate(parts).astype(np.float32)
+            LOG_MSG.debug(
+                "VAD flush: %.2f s of speech emitted", len(segment) / self.SAMPLE_RATE
+            )
+
+        self._speech_chunks = []
+        self._speech_samples = 0
+        self._silence_counter = 0
+        self._in_speech = False
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        return segment
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _reset_silero_states(self):
+        try:
+            _SILERO_MODEL.reset_states()
+        except Exception:
+            pass
+
+    def _classify_chunk(self, chunk: np.ndarray):
+        """Return (is_speech: bool, confidence: float)."""
+        if _SILERO_AVAILABLE:
+            return self._silero_classify(chunk)
+        return self._energy_classify(chunk)
+
+    def _silero_classify(self, chunk: np.ndarray):
+        try:
+            tensor = self._torch.from_numpy(chunk).unsqueeze(0)
+            with self._torch.no_grad():
+                prob = _SILERO_MODEL(tensor, self.SAMPLE_RATE).item()
+            return prob >= self._threshold, prob
+        except Exception as exc:
+            LOG_MSG.warning("Silero inference error: %s \u2013 using energy fallback", exc)
+            return self._energy_classify(chunk)
+
+    @staticmethod
+    def _energy_classify(chunk: np.ndarray):
+        """RMS energy threshold.  Works reasonably well in quiet environments."""
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        # Threshold tuned for normalised float32 audio (-1 \u2026 +1).
+        # Typical quiet background: ~0.003; typical speech: >0.015
+        threshold = 0.015
+        return rms >= threshold, rms
+
+    def _on_speech_chunk(self, chunk, confidence, out_segments):
+        if not self._in_speech:
+            LOG_MSG.debug("VAD: speech onset (confidence=%.3f)", confidence)
+            self._in_speech = True
+            self._silence_counter = 0
+            # Prepend pre-speech padding to avoid clipping onset
+            for pre_chunk in self._pre_buf:
+                self._speech_chunks.append(pre_chunk)
+                self._speech_samples += len(pre_chunk)
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples += len(chunk)
+        self._silence_counter = 0  # Reset silence counter on any speech
+
+        # Hard ceiling: flush now and continue accumulating
+        if self._speech_samples >= self._max_speech_samples:
+            LOG_MSG.debug(
+                "VAD: max duration (%.0f s) reached \u2013 intermediate flush",
+                self._max_speech_samples / self.SAMPLE_RATE,
+            )
+            segment = np.concatenate(self._speech_chunks).astype(np.float32)
+            out_segments.append(segment)
+            # Keep in_speech = True; reset accumulators but NOT silence counter
+            self._speech_chunks = []
+            self._speech_samples = 0
+
+    def _on_silence_chunk(self, chunk, out_segments):
+        # Always push into pre-speech buffer (circular)
+        self._pre_buf.append(chunk)
+
+        if not self._in_speech:
+            return
+
+        # Inside an utterance \u2013 count the silence
+        self._speech_chunks.append(chunk)
+        self._speech_samples += len(chunk)
+        self._silence_counter += len(chunk)
+
+        if self._silence_counter >= self._silence_samples:
+            duration = self._speech_samples / self.SAMPLE_RATE
+            LOG_MSG.debug(
+                "VAD: speech end after %.2f s (silence threshold reached)", duration
+            )
+            if self._speech_samples >= self._min_speech_samples:
+                segment = np.concatenate(self._speech_chunks).astype(np.float32)
+                out_segments.append(segment)
+            else:
+                LOG_MSG.debug(
+                    "VAD: discarding short segment (%.3f s < %.3f s min)",
+                    duration,
+                    self._min_speech_samples / self.SAMPLE_RATE,
+                )
+            self._speech_chunks = []
+            self._speech_samples = 0
+            self._silence_counter = 0
+            self._in_speech = False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 sttgstwhisper.py — GStreamer/Whisper backend for IBus STT
 
