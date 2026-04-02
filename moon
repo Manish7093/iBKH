@@ -1,3 +1,91 @@
+def _download_model_thread(self, model_name, language, status):
+        """Download a Moonshine model using the moonshine_voice CLI."""
+        import subprocess
+        import re
+
+        try:
+            self.download_progress = STTDownloadState.UNKNOWN_PROGRESS
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                return
+
+            LOG_MSG.info(
+                "Downloading Moonshine model: name=%s, language=%s",
+                model_name, language,
+            )
+
+            process = subprocess.Popen(
+                ["python3", "-m", "moonshine_voice.download", "--language", language],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            model_path = None
+            model_arch = None
+
+            for line in process.stdout:
+                if status.is_cancelled():
+                    process.kill()
+                    self.download_progress = STTDownloadState.STOPPED
+                    return
+
+                line = line.strip()
+                LOG_MSG.debug("moonshine download: %s", line)
+
+                # Parse percentage from pip-style progress bars like "45%|███"
+                pct_match = re.search(r'(\d+)%\|', line)
+                if pct_match:
+                    pct = int(pct_match.group(1))
+                    self.download_progress = max(pct / 100.0, STTDownloadState.ONGOING)
+
+                # Parse "Downloaded model path: /path/to/model"
+                if "Downloaded model path:" in line:
+                    model_path = line.split("Downloaded model path:")[-1].strip()
+
+                # Parse "Model arch: 1"
+                if "Model arch:" in line:
+                    try:
+                        model_arch = int(line.split("Model arch:")[-1].strip())
+                    except ValueError:
+                        pass
+
+            process.wait()
+
+            if process.returncode != 0:
+                LOG_MSG.error("Moonshine download failed with return code %d", process.returncode)
+                self.download_progress = STTDownloadState.STOPPED
+                GLib.idle_add(self._download_finished)
+                return
+
+            if model_path:
+                self.arch = model_arch
+                if model_path not in self.paths:
+                    self.paths.append(model_path)
+                LOG_MSG.info(
+                    "Model downloaded: path=%s, arch=%s", model_path, model_arch
+                )
+            else:
+                LOG_MSG.error("Download completed but no model path found in output")
+
+        except FileNotFoundError:
+            LOG_MSG.error(
+                "python3 or moonshine_voice not found. "
+                "Install with: pip install moonshine-voice"
+            )
+        except Exception as e:
+            LOG_MSG.error("Download error: %s", e)
+
+        self.download_progress = STTDownloadState.STOPPED
+        GLib.idle_add(self._download_finished)
+
+
+
+
+
+
+
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: User <user@example.com>
 Date: Thu, 02 Apr 2026 00:00:00 +0530
