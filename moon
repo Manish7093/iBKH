@@ -1,3 +1,60 @@
+def _load_moonshine_model(self, model_path, model_arch):
+        """Load Moonshine model using moonshine-voice library."""
+        if not MOONSHINE_AVAILABLE:
+            LOG_MSG.error("moonshine-voice not available")
+            return False
+
+        try:
+            from moonshine_voice.moonshine_api import ModelArch
+
+            LOG_MSG.info(
+                "Loading Moonshine model: path=%s, arch=%s", model_path, model_arch
+            )
+
+            # Stop any existing transcriber
+            self._stop_transcriber()
+
+            # Convert int arch to ModelArch enum
+            if isinstance(model_arch, int):
+                model_arch_enum = ModelArch(model_arch)
+            else:
+                model_arch_enum = model_arch
+
+            # Determine options based on locale
+            options = {}
+            lang_code = None
+            if self._current_locale and self._current_locale.locale:
+                lang_code = self._current_locale.locale[:2]
+
+            if lang_code and lang_code in ('ar', 'ja', 'ko', 'zh', 'uk', 'vi'):
+                options['max_tokens_per_second'] = '13.0'
+
+            self._transcriber = Transcriber(
+                model_path=model_path,
+                model_arch=model_arch_enum,
+                options=options if options else None,
+            )
+
+            # Create and attach the event listener
+            self._listener = _MoonshineListener(self._emit_text)
+            self._transcriber.add_listener(self._listener)
+
+            LOG_MSG.info("Moonshine model loaded successfully")
+            return True
+
+        except Exception as e:
+            LOG_MSG.error("Failed to load Moonshine model: %s", e)
+            self._transcriber = None
+            self._listener = None
+            return False
+
+
+
+
+
+
+
+
 IBus-Speech-To-Text/builddir$ /usr/libexec/ibus-engine-stt 
 INFO: 	main.py:49:__init__: 	Init
 INFO: 	main.py:60:do_handle_local_options: 	Local options parsing
