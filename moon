@@ -1,3 +1,17 @@
+IBus-Speech-To-Text/builddir$ /usr/libexec/ibus-engine-stt 
+INFO: 	main.py:49:__init__: 	Init
+INFO: 	main.py:60:do_handle_local_options: 	Local options parsing
+INFO: 	main.py:84:do_startup: 	startup
+INFO: 	main.py:91:do_command_line: 	Remote options parsing False
+INFO: 	main.py:117:do_activate: 	activated (False/('en_US', 'UTF-8'))
+INFO: 	sttgstfactory.py:56:new_engine: 	Using Moonshine backend
+INFO: 	sttgstmoonshine.py:150:_load_moonshine_model: 	Loading Moonshine model: path=/home/matiwari/.cache/moonshine_voice/download.moonshine.ai/model/tiny-streaming-en/quantized, arch=2
+ERROR: 	sttgstmoonshine.py:182:_load_moonshine_model: 	Failed to load Moonshine model: 'int' object has no attribute 'value'
+INFO: 	sttgstfactory.py:76:__update_preloaded_engine: 	preloading engine
+
+
+
+
 """
 IBus STT - Moonshine model managers
 
