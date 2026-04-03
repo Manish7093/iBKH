@@ -1,3 +1,762 @@
+"""
+IBus STT - Moonshine model managers
+
+Manages discovery, downloading, and lifecycle of Moonshine ASR models.
+
+Key differences from Whisper models:
+- Moonshine models are *directories* containing multiple files
+- Non-streaming models: encoder_model.ort, decoder_model_merged.ort, tokenizer.bin
+- Streaming models: adapter.ort, cross_kv.ort, decoder_kv.ort, encoder.ort,
+  frontend.ort, streaming_config.json, tokenizer.bin
+- Models are language-specific (e.g., base-en, base-ja)
+- Downloads use the moonshine_voice Python API directly
+- Model architectures are identified by integer IDs from ModelArch enum
+"""
+
+import os
+import json
+import logging
+import threading
+import uuid
+from pathlib import Path
+from enum import Enum
+
+from gi.repository import GObject, Gio, GLib
+
+LOG_MSG = logging.getLogger()
+
+# Try importing Moonshine ModelArch for correct arch values
+try:
+    from moonshine_voice.moonshine_api import ModelArch
+    _TINY = int(ModelArch.TINY)
+    _BASE = int(ModelArch.BASE)
+    _TINY_STREAMING = int(ModelArch.TINY_STREAMING)
+    _SMALL_STREAMING = int(ModelArch.SMALL_STREAMING)
+    _MEDIUM_STREAMING = int(ModelArch.MEDIUM_STREAMING)
+except ImportError:
+    _TINY = 0
+    _BASE = 1
+    _TINY_STREAMING = 2
+    _SMALL_STREAMING = 3
+    _MEDIUM_STREAMING = 4
+
+# Required files for NON-streaming models
+NON_STREAMING_MODEL_FILES = [
+    "encoder_model.ort",
+    "decoder_model_merged.ort",
+    "tokenizer.bin",
+]
+
+# Required files for STREAMING models
+STREAMING_MODEL_FILES = [
+    "adapter.ort",
+    "cross_kv.ort",
+    "decoder_kv.ort",
+    "encoder.ort",
+    "frontend.ort",
+    "streaming_config.json",
+    "tokenizer.bin",
+]
+
+# Standard directories to scan for Moonshine models
+_home_cache = Path.home() / ".cache" / "moonshine_voice"
+MODEL_DIRS = [
+    os.getenv("MOONSHINE_VOICE_CACHE"),
+    str(_home_cache),
+    "/usr/share/moonshine",
+    "/usr/local/share/moonshine",
+]
+
+# Language code to full name mapping
+LANGUAGE_MAP = {
+    "en": "english",
+    "ar": "arabic",
+    "ja": "japanese",
+    "ko": "korean",
+    "zh": "mandarin",
+    "es": "spanish",
+    "uk": "ukrainian",
+    "vi": "vietnamese",
+}
+
+# Known Moonshine models catalog
+# name -> (language_code, size_str, arch)
+MOONSHINE_MODELS = {
+    "tiny-en":              ("en", "26 MB",  _TINY),
+    "tiny-streaming-en":    ("en", "34 MB",  _TINY_STREAMING),
+    "base-en":              ("en", "58 MB",  _BASE),
+    "small-streaming-en":   ("en", "123 MB", _SMALL_STREAMING),
+    "medium-streaming-en":  ("en", "245 MB", _MEDIUM_STREAMING),
+    "base-ar":              ("ar", "58 MB",  _BASE),
+    "base-ja":              ("ja", "58 MB",  _BASE),
+    "tiny-ja":              ("ja", "26 MB",  _TINY),
+    "tiny-ko":              ("ko", "26 MB",  _TINY),
+    "base-zh":              ("zh", "58 MB",  _BASE),
+    "base-es":              ("es", "58 MB",  _BASE),
+    "base-uk":              ("uk", "58 MB",  _BASE),
+    "base-vi":              ("vi", "58 MB",  _BASE),
+}
+
+DOWNLOADED_MODEL_SUFFIX = ".downloading_tmp"
+
+
+def _is_valid_moonshine_model_dir(dir_path):
+    """Check if a directory contains valid Moonshine model files (streaming or non-streaming)."""
+    p = Path(dir_path)
+    if not p.is_dir():
+        return False
+    has_non_streaming = all((p / f).is_file() for f in NON_STREAMING_MODEL_FILES)
+    has_streaming = all((p / f).is_file() for f in STREAMING_MODEL_FILES)
+    return has_non_streaming or has_streaming
+
+
+def _detect_model_info(model_dir_path):
+    """Try to detect model name, language, and arch from directory path/name."""
+    dir_name = Path(model_dir_path).name
+    all_parts = Path(model_dir_path).parts
+
+    # Try to match against known models by checking all path parts
+    for part in all_parts:
+        for model_name, (lang, size, arch) in MOONSHINE_MODELS.items():
+            if part == model_name:
+                return model_name, lang, arch
+
+    # Try direct directory name match
+    for model_name, (lang, size, arch) in MOONSHINE_MODELS.items():
+        if dir_name == model_name:
+            return model_name, lang, arch
+
+    # Try to infer language from directory name pattern like "base-en"
+    lang_code = None
+    if "-" in dir_name:
+        suffix = dir_name.split("-")[-1]
+        if suffix in LANGUAGE_MAP:
+            lang_code = suffix
+
+    return dir_name, lang_code, None
+
+
+class STTDownloadState(float, Enum):
+    STOPPED = -1.0
+    UNKNOWN_PROGRESS = -0.5
+    UNPACKING = -0.6
+    ONGOING = 0.0
+
+
+class STTMoonshineModelDescription(GObject.Object):
+    __gtype_name__ = "STTMoonshineModelDescription"
+
+    def __init__(self, init_model=None):
+        super().__init__()
+        self.name = init_model.name if init_model is not None else ""
+        self.custom = init_model.custom if init_model is not None else False
+        self.is_obsolete = False
+        self.paths = init_model.paths if init_model is not None else []
+        self.size = init_model.size if init_model is not None else ""
+        self.type = init_model.type if init_model is not None else ""
+        self.locale = init_model.locale if init_model is not None else ""
+        self.url = init_model.url if init_model is not None else ""
+        self.arch = init_model.arch if init_model is not None else None
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+
+    def _download_finished(self):
+        if self._operation is not None and self._operation.is_cancelled():
+            self._operation = None
+
+    def _download_model_thread(self, model_name, language, status):
+        """Download a Moonshine model using the moonshine_voice API directly."""
+        try:
+            from moonshine_voice.download import find_model_info, download_model_from_info
+
+            self.download_progress = STTDownloadState.UNKNOWN_PROGRESS
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                return
+
+            LOG_MSG.info(
+                "Downloading Moonshine model: name=%s, language=%s",
+                model_name, language,
+            )
+
+            # Find the specific model arch from our catalog
+            target_arch = None
+            for cat_name, (cat_lang, cat_size, cat_arch) in MOONSHINE_MODELS.items():
+                if cat_name == model_name:
+                    target_arch = cat_arch
+                    break
+
+            # Get model info for the specific arch
+            model_info = find_model_info(language, target_arch)
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                return
+
+            self.download_progress = 0.3
+            model_path, model_arch = download_model_from_info(model_info)
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                return
+
+            if model_path and Path(model_path).is_dir():
+                self.arch = int(model_arch)
+                if model_path not in self.paths:
+                    self.paths.append(model_path)
+                LOG_MSG.info(
+                    "Model downloaded: path=%s, arch=%s", model_path, model_arch
+                )
+            else:
+                LOG_MSG.error("Download completed but model path invalid: %s", model_path)
+
+        except ImportError:
+            LOG_MSG.error(
+                "moonshine_voice not installed. Install with: pip install moonshine-voice"
+            )
+        except Exception as e:
+            LOG_MSG.error("Download error: %s", e, exc_info=True)
+
+        self.download_progress = STTDownloadState.STOPPED
+        GLib.idle_add(self._download_finished)
+
+    def stop_downloading(self):
+        if self._operation is not None:
+            self._operation.cancel()
+
+    def start_downloading(self):
+        if self._operation is not None:
+            return
+
+        # Resolve language from locale
+        lang_code = self.locale if self.locale else "en"
+
+        LOG_MSG.debug("start downloading Moonshine model (%s, lang=%s)", self.name, lang_code)
+
+        self.download_progress = STTDownloadState.ONGOING
+        self._operation = Gio.Cancellable()
+
+        download_thread = threading.Thread(
+            target=self._download_model_thread,
+            args=(self.name, lang_code, self._operation),
+            daemon=True,
+        )
+        download_thread.start()
+
+    def get_best_path_for_model(self):
+        if self.paths in [None, []]:
+            return None
+        return self.paths[0]
+
+    def delete_paths(self):
+        if self.custom is True:
+            return
+
+        for path in self.paths:
+            model_dir = Path(path)
+            # Only delete from the user cache directory
+            if str(model_dir).startswith(str(_home_cache)):
+                try:
+                    if model_dir.is_dir():
+                        import shutil
+                        shutil.rmtree(model_dir)
+                    elif model_dir.is_file():
+                        model_dir.unlink()
+                except Exception as e:
+                    LOG_MSG.error("Failed to delete %s: %s", path, e)
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+        self.paths = []
+
+
+class STTMoonshineLocalModelManager(GObject.Object):
+    __gtype_name__ = "STTMoonshineLocalModelManager"
+
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (str, str)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (str, str)),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._monitors = []
+        self._models_dict = {}       # model_name -> model_desc
+        self._locales_dict = {}      # locale -> [model_desc, ...]
+        self._model_paths_dict = {}  # path_str -> model_desc
+        self._custom_paths = {}
+        self._get_available_local_models()
+
+    def _add_model_description_to_locale(self, model_desc):
+        if model_desc.locale is None:
+            return
+
+        models_list = self._locales_dict.get(model_desc.locale, None)
+        if models_list is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            if model_desc not in models_list:
+                models_list.append(model_desc)
+
+    def _new_model_available(self, model_path):
+        """Register a newly discovered Moonshine model directory."""
+        model_path = Path(model_path)
+
+        if str(model_path).endswith(DOWNLOADED_MODEL_SUFFIX):
+            LOG_MSG.debug("model path is a temporary file (%s)", model_path)
+            return None
+
+        if not _is_valid_moonshine_model_dir(model_path):
+            LOG_MSG.debug("not a valid Moonshine model directory (%s)", model_path)
+            return None
+
+        if not os.access(model_path, os.R_OK):
+            LOG_MSG.debug("access rights are wrong (%s)", model_path)
+            return None
+
+        path_str = str(model_path)
+        if self.path_available(path_str):
+            LOG_MSG.debug("model directory already in list (%s)", model_path)
+            return None
+
+        model_name, lang_code, arch = _detect_model_info(model_path)
+
+        # Check if this is a custom path (not in standard dirs)
+        is_in_standard_dir = False
+        for d in MODEL_DIRS:
+            if d and path_str.startswith(str(d)):
+                is_in_standard_dir = True
+                break
+
+        if not is_in_standard_dir:
+            # Custom model
+            model_desc = STTMoonshineModelDescription()
+            model_desc.paths = [path_str]
+            model_desc.name = model_name
+            model_desc.custom = True
+            model_desc.locale = lang_code
+            model_desc.arch = arch
+
+            self._models_dict[path_str] = model_desc
+            self._model_paths_dict[path_str] = model_desc
+
+            LOG_MSG.debug("custom Moonshine model found (%s)", model_path)
+            return model_desc
+
+        # Standard model
+        model_desc = self._models_dict.get(model_name, None)
+        if model_desc is None:
+            model_desc = STTMoonshineModelDescription()
+            model_desc.paths = [path_str]
+            model_desc.locale = lang_code
+            model_desc.name = model_name
+            model_desc.arch = arch
+
+            # Look up size from catalog
+            if model_name in MOONSHINE_MODELS:
+                _, size, catalog_arch = MOONSHINE_MODELS[model_name]
+                model_desc.size = size
+                if model_desc.arch is None:
+                    model_desc.arch = catalog_arch
+
+            self._add_model_description_to_locale(model_desc)
+            self._models_dict[model_name] = model_desc
+            self._model_paths_dict[path_str] = model_desc
+
+            LOG_MSG.debug("Moonshine model found (%s) - new", model_path)
+            self.emit("added", model_name, path_str)
+            return model_desc
+
+        # Already known model name, add this path
+        if path_str not in model_desc.paths:
+            model_desc.paths.append(path_str)
+
+        self._model_paths_dict[path_str] = model_desc
+
+        LOG_MSG.debug("Moonshine model found (%s) - already known", model_path)
+        self.emit("added", model_name, path_str)
+        return model_desc
+
+    def _remove_model_description(self, model_path_str):
+        model_desc = self._model_paths_dict.pop(model_path_str, None)
+        if model_desc is None:
+            return
+
+        LOG_MSG.debug("model removed (%s)", model_path_str)
+
+        if model_path_str in model_desc.paths:
+            model_desc.paths.remove(model_path_str)
+
+        if not any(model_desc.paths):
+            models_list = self._locales_dict.get(model_desc.locale, [])
+            if model_desc in models_list:
+                models_list.remove(model_desc)
+            if not any(models_list):
+                self._locales_dict.pop(model_desc.locale, None)
+
+            key = model_desc.name if not model_desc.custom else model_path_str
+            self._models_dict.pop(key, None)
+
+        model_name = model_desc.name if not model_desc.custom else None
+        self.emit("removed", model_name, model_path_str)
+
+    def _model_dir_changed_cb(self, monitor, file, other_file, event_type):
+        """Handle filesystem changes in model directories."""
+        file_path = file.get_path()
+
+        # Skip top-level directory events
+        if file_path in [str(d) for d in MODEL_DIRS if d]:
+            return
+
+        LOG_MSG.info(
+            "a model directory changed (%s) (event=%s)", file_path, event_type
+        )
+
+        if event_type == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            if file_path.endswith(DOWNLOADED_MODEL_SUFFIX):
+                return
+            path = Path(file_path)
+            # Walk up to find a valid model dir
+            for candidate in [path, path.parent, path.parent.parent]:
+                if _is_valid_moonshine_model_dir(candidate):
+                    self._new_model_available(candidate)
+                    return
+
+        elif event_type == Gio.FileMonitorEvent.DELETED:
+            self._remove_model_description(file_path)
+
+    def _scan_directory_recursive(self, directory_path, depth=0, max_depth=6):
+        """Scan a directory for Moonshine model subdirectories."""
+        if not directory_path.is_dir() or depth > max_depth:
+            return
+
+        # Check if this directory itself is a model
+        if _is_valid_moonshine_model_dir(directory_path):
+            self._new_model_available(directory_path)
+            return
+
+        # Recurse into children
+        try:
+            for child in directory_path.iterdir():
+                if child.is_dir():
+                    self._scan_directory_recursive(child, depth + 1, max_depth)
+        except PermissionError:
+            LOG_MSG.debug("permission denied scanning %s", directory_path)
+
+    def _get_available_local_models(self):
+        """Scan all model directories for available models."""
+        for directory in MODEL_DIRS:
+            LOG_MSG.debug("scanning %s for Moonshine models", directory)
+
+            if directory is None:
+                continue
+
+            dir_path = Path(directory)
+
+            # Set up file monitoring
+            monitor = Gio.File.new_for_path(str(dir_path)).monitor_directory(
+                Gio.FileMonitorFlags.NONE, None
+            )
+            if monitor is not None:
+                monitor.connect("changed", self._model_dir_changed_cb)
+                self._monitors.append(monitor)
+
+            self._scan_directory_recursive(dir_path)
+
+    def path_available(self, model_path):
+        return model_path in self._model_paths_dict
+
+    def get_models_for_locale(self, locale_str):
+        # Try exact match first, then 2-letter code
+        models = self._locales_dict.get(locale_str, []).copy()
+        short_locale = locale_str[:2] if len(locale_str) > 2 else locale_str
+        if short_locale != locale_str:
+            models.extend(self._locales_dict.get(short_locale, []))
+        return models
+
+    def get_best_path_for_model(self, model_name):
+        if model_name is None:
+            return None
+
+        model = self._models_dict.get(model_name, None)
+        if model is None:
+            return None
+
+        if model.paths in [None, []]:
+            return None
+
+        return model.paths[0]
+
+    def get_model_description(self, model_name):
+        return self._models_dict.get(model_name, None)
+
+    def get_model_description_by_path(self, model_path):
+        return self._model_paths_dict.get(model_path, None)
+
+    def get_supported_locales(self):
+        return list(self._locales_dict.keys())
+
+    def _custom_model_dir_changed_cb(self, monitor, file, other_file, event_type):
+        file_path = file.get_path()
+        LOG_MSG.info(
+            "custom model changed (%s) (event=%s)", file_path, event_type
+        )
+        if event_type == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            path = Path(file_path)
+            if _is_valid_moonshine_model_dir(path):
+                self._new_model_available(path)
+            elif _is_valid_moonshine_model_dir(path.parent):
+                self._new_model_available(path.parent)
+
+        elif event_type == Gio.FileMonitorEvent.DELETED:
+            model = self._model_paths_dict.get(file_path, None)
+            if model is None:
+                return
+            self._model_paths_dict.pop(file_path, None)
+            self.emit("removed", None, file_path)
+
+    def register_custom_model_path(self, model_path_str, locale_str):
+        """Register a custom model path outside standard directories."""
+        for d in MODEL_DIRS:
+            if d and model_path_str.startswith(str(d)):
+                LOG_MSG.debug(
+                    "registered path is in standard directory (%s)", model_path_str
+                )
+                return
+
+        monitor = self._custom_paths.get(model_path_str, None)
+        if monitor is not None:
+            monitor.refcount += 1
+            LOG_MSG.debug(
+                "custom path already registered (%s). refcount=%i",
+                model_path_str,
+                monitor.refcount,
+            )
+            return
+
+        # Monitor the directory for changes
+        monitor = Gio.File.new_for_path(model_path_str).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None
+        )
+        if monitor is not None:
+            monitor.connect("changed", self._custom_model_dir_changed_cb)
+            self._custom_paths[model_path_str] = monitor
+            monitor.refcount = 1
+
+        model_desc = self._new_model_available(Path(model_path_str))
+        if model_desc:
+            model_desc.locale = locale_str
+            self._add_model_description_to_locale(model_desc)
+            self.emit("added", None, model_path_str.rstrip("/"))
+
+    def unregister_custom_model_path(self, model_path_str):
+        monitor = self._custom_paths.get(model_path_str, None)
+        if monitor is None:
+            LOG_MSG.debug(
+                "trying to unregister unknown custom path (%s)", model_path_str
+            )
+            return
+
+        if monitor.refcount != 1:
+            monitor.refcount -= 1
+            return
+
+        self._custom_paths.pop(model_path_str, None)
+        self._remove_model_description(model_path_str)
+
+
+_GLOBAL_LOCAL_MANAGER = None
+
+
+def stt_moonshine_local_model_manager():
+    global _GLOBAL_LOCAL_MANAGER
+    if _GLOBAL_LOCAL_MANAGER is None:
+        _GLOBAL_LOCAL_MANAGER = STTMoonshineLocalModelManager()
+    return _GLOBAL_LOCAL_MANAGER
+
+
+class STTMoonshineOnlineModelManager(GObject.Object):
+    __gtype_name__ = "STTMoonshineOnlineModelManager"
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "changed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+    }
+
+    def __init__(self):
+        super().__init__()
+
+        self._locales_dict = {}
+        self._online_models = {}
+
+        local_manager = stt_moonshine_local_model_manager()
+        local_manager.connect("added", self._model_path_added_cb)
+        local_manager.connect("removed", self._model_path_removed_cb)
+        self._populate_with_moonshine_models()
+
+    def _populate_with_moonshine_models(self):
+        """Populate the catalog with known Moonshine models."""
+        for model_name, (lang_code, size, arch) in MOONSHINE_MODELS.items():
+            model_desc = STTMoonshineModelDescription()
+            model_desc.name = model_name
+            model_desc.size = size
+            model_desc.locale = lang_code
+            model_desc.arch = arch
+            model_desc.url = "https://download.moonshine.ai/model/" + model_name
+
+            # Determine model type (architecture variant)
+            if "streaming" in model_name:
+                parts = model_name.split("-")
+                model_desc.type = "-".join(parts[:-1])
+            else:
+                model_desc.type = model_name.split("-")[0]
+
+            # Check if already downloaded locally
+            local_desc = stt_moonshine_local_model_manager().get_model_description(
+                model_name
+            )
+            if local_desc is not None:
+                model_desc.paths = local_desc.paths
+                if local_desc.arch is not None:
+                    model_desc.arch = local_desc.arch
+
+            if model_name in self._online_models:
+                existing = self._online_models[model_name]
+                if not existing.paths and model_desc.paths:
+                    existing.paths = model_desc.paths
+                continue
+
+            self._online_models[model_name] = model_desc
+            self._add_model_description_to_locale(model_desc)
+
+        # Also add any locally-found models not in the catalog
+        for locale in stt_moonshine_local_model_manager().get_supported_locales():
+            model_list = stt_moonshine_local_model_manager().get_models_for_locale(
+                locale
+            )
+            for model_desc in model_list:
+                key = model_desc.name if not model_desc.custom else model_desc.paths[0]
+                if key in self._online_models:
+                    continue
+
+                LOG_MSG.debug("adding local-only model to catalog (%s)", key)
+                self._online_models[key] = model_desc
+                self._add_model_description_to_locale(model_desc)
+
+    def _add_model_description_to_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+        if locale_models is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            if model_desc not in locale_models:
+                locale_models.append(model_desc)
+
+    def _model_path_added_cb(self, manager, model_name, model_path):
+        if model_name is not None:
+            online_model_desc = self._online_models.get(model_name, None)
+            local_model_desc = manager.get_model_description(model_name)
+        else:
+            online_model_desc = self._online_models.get(model_path, None)
+            local_model_desc = manager.get_model_description_by_path(model_path)
+
+        if local_model_desc is None:
+            return
+
+        if online_model_desc is not None:
+            if online_model_desc.paths in [None, []]:
+                online_model_desc.paths = local_model_desc.paths
+            if local_model_desc.arch is not None:
+                online_model_desc.arch = local_model_desc.arch
+
+            self.emit("changed", online_model_desc)
+            return
+
+        key = (
+            local_model_desc.name
+            if not local_model_desc.custom
+            else local_model_desc.paths[0]
+        )
+        self._online_models[key] = local_model_desc
+        self._add_model_description_to_locale(local_model_desc)
+        self.emit("added", local_model_desc)
+
+    def _remove_model_description_from_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+        if locale_models and model_desc in locale_models:
+            locale_models.remove(model_desc)
+        if locale_models is not None and not any(locale_models):
+            self._locales_dict.pop(model_desc.locale, None)
+
+    def _model_path_removed_cb(self, manager, model_name, model_path):
+        if model_name is None:
+            online_model_desc = self._online_models.pop(model_path, None)
+            if online_model_desc:
+                self._remove_model_description_from_locale(online_model_desc)
+                self.emit("removed", online_model_desc)
+            return
+
+        online_model_desc = self._online_models.get(model_name, None)
+        if online_model_desc is None:
+            return
+
+        if any(online_model_desc.paths):
+            self.emit("changed", online_model_desc)
+            return
+
+        # Keep catalog entries (they can be re-downloaded)
+        if model_name in MOONSHINE_MODELS:
+            self.emit("changed", online_model_desc)
+            return
+
+        self._online_models.pop(model_name, None)
+        self._remove_model_description_from_locale(online_model_desc)
+        self.emit("removed", online_model_desc)
+
+    def get_model_description(self, model_name):
+        return self._online_models.get(model_name, None)
+
+    def get_models_for_locale(self, locale_str):
+        models = self._locales_dict.get(locale_str, []).copy()
+        short_locale = locale_str[:2] if len(locale_str) > 2 else locale_str
+        if short_locale != locale_str:
+            models.extend(self._locales_dict.get(short_locale, []))
+        # Deduplicate
+        seen = set()
+        result = []
+        for m in models:
+            if m.name not in seen:
+                seen.add(m.name)
+                result.append(m)
+        return result
+
+    def supported_locales(self):
+        return list(self._locales_dict.keys())
+
+
+_GLOBAL_ONLINE_MANAGER = None
+
+
+def stt_moonshine_online_model_manager():
+    global _GLOBAL_ONLINE_MANAGER
+    if _GLOBAL_ONLINE_MANAGER is None:
+        _GLOBAL_ONLINE_MANAGER = STTMoonshineOnlineModelManager()
+    return _GLOBAL_ONLINE_MANAGER
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _download_model_thread(self, model_name, language, status):
         """Download a Moonshine model using the moonshine_voice CLI."""
         import subprocess
