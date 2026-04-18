@@ -1,3 +1,807 @@
+IBus-Speech-To-Text$ /usr/libexec/ibus-engine-stt 
+The repository snakers4_silero-vad does not belong to the list of trusted repositories and as such cannot be downloaded. Do you trust this repository and wish to add it to the trusted list of repositories (y/N)?
+
+import logging
+import numpy as np
+from collections import deque
+
+LOG_MSG = logging.getLogger()
+
+_SILERO_MODEL = None
+_SILERO_AVAILABLE = False
+
+def _try_load_silero():
+    global _SILERO_MODEL, _SILERO_AVAILABLE
+    try:
+        import torch  # noqa: F401
+
+        _SILERO_MODEL, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=False,
+            verbose=False,
+        )
+        _SILERO_MODEL.eval()
+        _SILERO_AVAILABLE = True
+        LOG_MSG.info("Silero VAD loaded successfully")
+    except Exception as exc:
+        LOG_MSG.warning(
+            "Silero VAD not available (%s). "
+            "Install PyTorch for better VAD accuracy. "
+            "Falling back to energy-based VAD.",
+            exc,
+        )
+        _SILERO_AVAILABLE = False
+
+
+_try_load_silero()
+
+
+# ---------------------------------------------------------------------------
+# Public VAD class
+# ---------------------------------------------------------------------------
+
+class STTVad:
+    """
+    Stream-oriented Voice Activity Detector.
+
+    Feed raw PCM float32 audio (16 kHz, mono) in arbitrary chunk sizes via
+    :meth:`process`.  Complete speech *segments* (numpy float32 arrays) are
+    returned whenever an utterance ends.  Call :meth:`flush` before stopping
+    to retrieve any incomplete final segment.
+
+    Parameters
+    ----------
+    speech_threshold : float
+        Silero confidence threshold in [0, 1].  Higher \u2192 less sensitive.
+    silence_duration_ms : int
+        Continuous silence (ms) required to mark the end of an utterance.
+    speech_pad_ms : int
+        Pre-speech padding (ms) prepended before detected speech onset.
+    min_speech_duration_ms : int
+        Segments shorter than this are discarded as noise.
+    max_speech_duration_s : float
+        Force-flush a segment if it grows beyond this length.
+    freq_thold : float
+        High-pass frequency threshold in Hz (default 100 Hz).
+        Chunks whose energy is dominated by frequencies below this value
+        (>= low_energy_ratio of total energy) are rejected as non-speech
+        before Silero or the energy fallback are consulted.
+        Mirrors: vad_simple() freq_thold in whisper.cpp stream.cpp.
+        Set to 0.0 to disable the spectral gate entirely.
+    low_energy_ratio : float
+        If the fraction of energy below freq_thold exceeds this value, the
+        chunk is treated as non-speech by the spectral gate. Default 0.88.
+    """
+
+    # Silero VAD requires exactly 512 samples per inference call at 16 kHz.
+    _SILERO_CHUNK = 512
+    SAMPLE_RATE = 16000
+
+    def __init__(
+        self,
+        speech_threshold: float = 0.5,
+        silence_duration_ms: int = 600,
+        speech_pad_ms: int = 200,
+        min_speech_duration_ms: int = 300,
+        max_speech_duration_s: float = 30.0,
+        freq_thold: float = 100.0,         # NEW \u2013 mirrors stream.cpp freq_thold
+        low_energy_ratio: float = 0.88,    # NEW \u2013 gate sensitivity
+    ):
+        self._threshold = speech_threshold
+
+        # NEW: spectral gate params (stream.cpp freq_thold)
+        self._freq_thold = freq_thold
+        self._low_energy_ratio = low_energy_ratio
+
+        # Convert durations to samples
+        self._silence_samples     = int(silence_duration_ms   * self.SAMPLE_RATE / 1000)
+        self._pad_samples         = int(speech_pad_ms         * self.SAMPLE_RATE / 1000)
+        self._min_speech_samples  = int(min_speech_duration_ms * self.SAMPLE_RATE / 1000)
+        self._max_speech_samples  = int(max_speech_duration_s  * self.SAMPLE_RATE)
+
+        self._chunk_size = self._SILERO_CHUNK if _SILERO_AVAILABLE else 320
+
+        pad_chunks = max(1, self._pad_samples // self._chunk_size)
+        self._pre_buf: deque = deque(maxlen=pad_chunks)
+
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        self._speech_chunks: list = []
+        self._speech_samples: int = 0
+
+        self._in_speech: bool = False
+        self._silence_counter: int = 0
+
+        if _SILERO_AVAILABLE:
+            import torch as _torch
+            self._torch = _torch
+            self._reset_silero_states()
+        else:
+            self._torch = None
+
+        LOG_MSG.info(
+            "STTVad ready \u2013 backend: %s | freq_thold=%.0f Hz | low_energy_ratio=%.2f",
+            self.backend_name, self._freq_thold, self._low_energy_ratio,
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    @property
+    def is_silero(self) -> bool:
+        return _SILERO_AVAILABLE
+
+    @property
+    def backend_name(self) -> str:
+        return "Silero VAD" if _SILERO_AVAILABLE else "Energy-based VAD (fallback)"
+
+    def reset(self) -> None:
+        """Reset all internal state (call when starting a new recording session)."""
+        self._pre_buf.clear()
+        self._leftover = np.empty(0, dtype=np.float32)
+        self._speech_chunks = []
+        self._speech_samples = 0
+        self._in_speech = False
+        self._silence_counter = 0
+        if _SILERO_AVAILABLE:
+            self._reset_silero_states()
+
+    def process(self, audio: np.ndarray) -> list:
+        """
+        Feed incoming audio and return a list of completed speech segments.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Float32 PCM, 16 kHz, mono.  Any length is accepted.
+
+        Returns
+        -------
+        list of np.ndarray
+            Zero or more completed speech segments ready for transcription.
+        """
+        completed_segments = []
+
+        if len(self._leftover):
+            audio = np.concatenate([self._leftover, audio])
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        offset = 0
+        while offset + self._chunk_size <= len(audio):
+            chunk = audio[offset: offset + self._chunk_size]
+            offset += self._chunk_size
+
+            # NEW: spectral gate pre-filter (stream.cpp freq_thold).
+            # Reject chunks dominated by sub-100 Hz energy (HVAC, hum, rumble)
+            # before handing off to Silero or energy classify.  This is fast
+            # (rfft of 512 samples \u2248 10 �s) and runs unconditionally.
+            if self._freq_thold > 0.0 and not self._spectral_gate(chunk):
+                self._on_silence_chunk(chunk, completed_segments)
+                continue
+
+            is_speech, confidence = self._classify_chunk(chunk)
+
+            if is_speech:
+                self._on_speech_chunk(chunk, confidence, completed_segments)
+            else:
+                self._on_silence_chunk(chunk, completed_segments)
+
+        if offset < len(audio):
+            self._leftover = audio[offset:].copy()
+
+        return completed_segments
+
+    def flush(self) -> "np.ndarray | None":
+        """
+        Flush remaining buffered speech.
+
+        Call this when recording stops so the last utterance is not lost.
+
+        Returns
+        -------
+        np.ndarray or None
+            A speech segment, or None if the buffer was empty / too short.
+        """
+        segment = None
+        if self._in_speech and self._speech_samples >= self._min_speech_samples:
+            parts = list(self._speech_chunks)
+            if len(self._leftover):
+                parts.append(self._leftover)
+            segment = np.concatenate(parts).astype(np.float32)
+            LOG_MSG.debug(
+                "VAD flush: %.2f s of speech emitted", len(segment) / self.SAMPLE_RATE
+            )
+
+        self._speech_chunks = []
+        self._speech_samples = 0
+        self._silence_counter = 0
+        self._in_speech = False
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        return segment
+
+    # ------------------------------------------------------------------
+    # NEW: Spectral gate (mirrors vad_simple freq_thold in stream.cpp)
+    # ------------------------------------------------------------------
+
+    def _spectral_gate(self, chunk: np.ndarray) -> bool:
+        """
+        Return True when the chunk contains enough high-frequency energy to
+        plausibly be speech.
+
+        Uses numpy's real-valued FFT (rfft) for efficiency.  At 16 kHz with
+        512-sample chunks the frequency resolution is 31.25 Hz/bin, so the
+        100 Hz default threshold maps cleanly to bin index 3.
+
+        Implementation mirrors vad_simple() in whisper.cpp:
+            // if the energy in the high-frequency band is above the threshold
+            // then this is likely speech
+            if (energy_all > 0.0f) {
+                if (energy_low / energy_all > freq_thold) return false;
+            }
+
+        A chunk is rejected (returns False) when the fraction of energy in
+        bins below self._freq_thold exceeds self._low_energy_ratio (0.88).
+        This correctly passes through speech (broadband), music (broadband),
+        and coughs/clicks, while filtering mains hum (50/60 Hz), HVAC rumble
+        (< 80 Hz), and DC offset artefacts.
+        """
+        # rfft gives bins 0 \u2026 N/2 inclusive; bin k \u2192 frequency k*Fs/N
+        n = len(chunk)
+        fft_mag = np.abs(np.fft.rfft(chunk))          # shape: (n//2 + 1,)
+        freqs   = np.fft.rfftfreq(n, d=1.0 / self.SAMPLE_RATE)
+
+        energy_total = float(np.dot(fft_mag, fft_mag))
+        if energy_total < 1e-12:
+            # Silent chunk \u2013 treat as no speech
+            return False
+
+        low_mask    = freqs < self._freq_thold
+        energy_low  = float(np.dot(fft_mag[low_mask], fft_mag[low_mask]))
+
+        # If the overwhelming majority of energy is sub-threshold \u2192 not speech
+        return (energy_low / energy_total) < self._low_energy_ratio
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _reset_silero_states(self):
+        try:
+            _SILERO_MODEL.reset_states()
+        except Exception:
+            pass
+
+    def _classify_chunk(self, chunk: np.ndarray):
+        """Return (is_speech: bool, confidence: float)."""
+        if _SILERO_AVAILABLE:
+            return self._silero_classify(chunk)
+        return self._energy_classify(chunk)
+
+    def _silero_classify(self, chunk: np.ndarray):
+        try:
+            tensor = self._torch.from_numpy(chunk).unsqueeze(0)
+            with self._torch.no_grad():
+                prob = _SILERO_MODEL(tensor, self.SAMPLE_RATE).item()
+            return prob >= self._threshold, prob
+        except Exception as exc:
+            LOG_MSG.warning("Silero inference error: %s \u2013 using energy fallback", exc)
+            return self._energy_classify(chunk)
+
+    @staticmethod
+    def _energy_classify(chunk: np.ndarray):
+        """
+        RMS energy threshold.
+
+        The spectral gate already ran before this, so here we only need a
+        simple amplitude check.  Typical quiet background: ~0.003;
+        typical speech: > 0.015.
+        """
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        threshold = 0.015
+        return rms >= threshold, rms
+
+    def _on_speech_chunk(self, chunk, confidence, out_segments):
+        if not self._in_speech:
+            LOG_MSG.debug("VAD: speech onset (confidence=%.3f)", confidence)
+            self._in_speech = True
+            self._silence_counter = 0
+            for pre_chunk in self._pre_buf:
+                self._speech_chunks.append(pre_chunk)
+                self._speech_samples += len(pre_chunk)
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples += len(chunk)
+        self._silence_counter = 0
+
+        if self._speech_samples >= self._max_speech_samples:
+            LOG_MSG.debug(
+                "VAD: max duration (%.0f s) reached \u2013 intermediate flush",
+                self._max_speech_samples / self.SAMPLE_RATE,
+            )
+            segment = np.concatenate(self._speech_chunks).astype(np.float32)
+            out_segments.append(segment)
+            self._speech_chunks = []
+            self._speech_samples = 0
+
+    def _on_silence_chunk(self, chunk, out_segments):
+        self._pre_buf.append(chunk)
+
+        if not self._in_speech:
+            return
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples += len(chunk)
+        self._silence_counter += len(chunk)
+
+        if self._silence_counter >= self._silence_samples:
+            duration = self._speech_samples / self.SAMPLE_RATE
+            LOG_MSG.debug(
+                "VAD: speech end after %.2f s (silence threshold reached)", duration
+            )
+            if self._speech_samples >= self._min_speech_samples:
+                segment = np.concatenate(self._speech_chunks).astype(np.float32)
+                out_segments.append(segment)
+            else:
+                LOG_MSG.debug(
+                    "VAD: discarding short segment (%.3f s < %.3f s min)",
+                    duration,
+                    self._min_speech_samples / self.SAMPLE_RATE,
+                )
+            self._speech_chunks = []
+            self._speech_samples = 0
+            self._silence_counter = 0
+            self._in_speech = False
+
+
+
+
+import logging
+import threading
+import queue
+import numpy as np
+import re
+import os
+
+from pathlib import Path
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttwhispermodel import STTWhisperModel
+
+LOG_MSG = logging.getLogger()
+SPECIAL_PATTERN = re.compile(r'^(?:\[[^\]]+\]|\([^)]+\))$',re.IGNORECASE)
+
+try:
+    from pywhispercpp.model import Model
+    WHISPER_AVAILABLE = True
+except ImportError:
+    LOG_MSG.warning("pywhispercpp not available. Install with: pip install pywhispercpp")
+    WHISPER_AVAILABLE = False
+try:
+    from sttvad import STTVad
+    VAD_MODULE_OK = True
+except ImportError:
+    LOG_MSG.warning("sttvad module not found \u2013 VAD disabled")
+    VAD_MODULE_OK = False
+
+WINDOW_SECONDS      = 5.0
+MIN_SAMPLES         = 1024
+SAMPLE_RATE         = 16000
+AUDIO_CTX           = 768
+TEMPERATURE_INC     = -1.0
+MAX_TOKENS          = 32
+_cpu_count = os.cpu_count() or 1
+N_THREADS           = max(4, _cpu_count // 2 )
+MAX_RING_QUEUE_DEPTH = 2
+
+_HALLUCINATION_EXACT = frozenset({
+    "thank you",
+    "thanks for watching",
+    "thanks for listening",
+    "thank you for watching",
+    "thank you for listening",
+    "please subscribe",
+    "like and subscribe",
+    "subtitles by",
+    "subtitled by",
+    "transcribed by",
+    "captions by",
+})
+
+_HALLUCINATION_RE = re.compile(
+    r"^[\s\W]*$"
+    r"|^\s*[\[\(\u266a\u266b\u2713\u2192].*[\]\)\u266a\u266b\u2713\u2192]\s*$",
+    re.UNICODE,
+)
+
+_TRAILING_WORD_RE = re.compile(
+    r'\b(\S+)(?:\s+\1){2,}\s*$',
+    re.UNICODE,
+)
+
+class STTGstWhisper(STTGstBase):
+    __gtype_name__ = 'STTGstWhisper'
+    _pipeline_def = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                    "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                    "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
+                    "queue ! " \
+                    "appsink name=WhisperSink emit-signals=true sync=false"
+
+    _pipeline_def_alt = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                        "queue ! " \
+                        "appsink name=WhisperSink emit-signals=true sync=false"
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstWhisper._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("WhisperSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model    = None
+        self._whisper  = None
+        self._vad      = None
+        self._set_model()
+
+        if VAD_MODULE_OK:
+            self._vad = STTVad(
+                speech_threshold=0.5,
+                silence_duration_ms=600,
+                speech_pad_ms=200,
+                min_speech_duration_ms=300,
+                max_speech_duration_s=15.0,
+                freq_thold=100.0,
+            )
+            LOG_MSG.info("VAD active: %s", self._vad.backend_name)
+        else:
+            self._vad = None
+            LOG_MSG.warning("VAD not available")
+
+        self._ring_buffer   = np.empty(0, dtype=np.float32)
+        self._ring_lock     = threading.Lock()
+        self._chunk_buffer  = []
+        self._chunk_samples = 0
+        self._process_queue   = queue.Queue()
+        self._process_thread  = None
+        self._stop_processing = False
+        self._use_partial_results = False
+
+    def __del__(self):
+        LOG_MSG.info("Whisper __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._appsink = None
+        self._whisper = None
+        self._vad     = None
+        LOG_MSG.info("Whisper.destroy() called")
+        super().destroy()
+
+    def _build_lang_code(self):
+        if not self._current_locale or not self._current_locale.locale:
+            return None
+        code = self._current_locale.locale[:2].lower()
+        return code if code.isalpha() else None
+
+    def _load_whisper_model(self, model_path):
+        """Load Whisper model using pywhispercpp"""
+        if not WHISPER_AVAILABLE:
+            LOG_MSG.error("pywhispercpp not available")
+            return False
+
+        try:
+            LOG_MSG.info("Loading Whisper model: %s", model_path)
+            lang_code = self._build_lang_code()
+
+            kwargs = dict(
+                print_realtime=False,
+                print_progress=False,
+                single_segment=True,
+                no_context=True,
+                audio_ctx=AUDIO_CTX,
+                temperature_inc=TEMPERATURE_INC,
+                max_tokens=MAX_TOKENS,
+                n_threads=N_THREADS,
+                no_speech_thold=0.6,
+                logprob_thold=-1.5,
+                entropy_thold=2.8,
+                suppress_blank=True,
+            )
+
+            if lang_code:
+                kwargs["language"] = lang_code
+
+            self._whisper = Model(model_path, **kwargs)
+            return True
+
+        except Exception as e:
+            LOG_MSG.error("Failed to load Whisper model: %s", e)
+            self._whisper = None
+            return False
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info("model path does not exist (%s - %s)",
+                        self._model.get_name() if self._model else "None",
+                        self._model.get_path() if self._model else "None")
+            self._whisper = None
+            self.emit("model-changed")
+            return
+
+        new_model_path = self._model.get_path()
+        LOG_MSG.debug("model ready %s", new_model_path)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        success = self._load_whisper_model(new_model_path)
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
+
+        if success:
+            if self._vad is not None:
+                self._vad.reset()
+            self.emit("model-changed")
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if (self._model is not None and
+                self._model.get_locale() == self._current_locale.locale):
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        self._model = STTWhisperModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    def _on_new_sample(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_data = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        audio_float = audio_data.astype(np.float32) / 32768.0
+
+        if self._vad is not None:
+            segments = self._vad.process(audio_float)
+            for segment in segments:
+                LOG_MSG.debug("VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE)
+                self._enqueue_for_transcription(segment, source='vad')
+        else:
+            self._chunk_buffer.append(audio_data)
+            self._chunk_samples += len(audio_data)
+            window_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+            if self._chunk_samples >= window_samples:
+                self._flush_chunks_to_ring()
+                self._dispatch_to_worker()
+
+        return Gst.FlowReturn.OK
+
+    def _flush_chunks_to_ring(self):
+        if not self._chunk_buffer:
+            return
+
+        new_samples = np.concatenate(self._chunk_buffer).astype(np.float32) / 32768.0
+        self._chunk_buffer.clear()
+        self._chunk_samples = 0
+
+        max_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+        with self._ring_lock:
+            self._ring_buffer = np.concatenate([self._ring_buffer, new_samples])
+            if len(self._ring_buffer) > max_samples:
+                self._ring_buffer = self._ring_buffer[-max_samples:]
+
+    def _dispatch_to_worker(self):
+
+        with self._ring_lock:
+            if len(self._ring_buffer) < MIN_SAMPLES:
+                return
+            snapshot = self._ring_buffer.copy()
+
+        self._enqueue_for_transcription(snapshot, source='ring')
+
+    def _enqueue_for_transcription(self, audio_float32: np.ndarray, source: str):
+        if source == 'ring':
+            pending_ring = sum(
+                1 for item in list(self._process_queue.queue)
+                if item[0] == 'ring'
+            )
+            if pending_ring >= MAX_RING_QUEUE_DEPTH:
+                temp = []
+                dropped = False
+                while True:
+                    try:
+                        item = self._process_queue.get_nowait()
+                        if item[0] == 'ring' and not dropped:
+                            self._process_queue.task_done()
+                            dropped = True
+                        else:
+                            temp.append(item)
+                    except queue.Empty:
+                        break
+                for item in temp:
+                    self._process_queue.put(item)
+
+        self._process_queue.put((source, audio_float32))
+
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
+            self._process_thread.start()
+
+    def _process_worker(self):
+        """Background worker to process audio"""
+        while not self._stop_processing:
+            try:
+                source, audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._whisper is None:
+                self._process_queue.task_done()
+                continue
+            try:
+                LOG_MSG.debug("Starting transcription of %d samples", len(audio))
+                segments = self._whisper.transcribe(audio)
+                segments_list = list(segments)
+                if segments_list:
+                    last_seg = segments_list[-1]
+                    text = last_seg.text.strip() if hasattr(last_seg, "text") else ""
+                else:
+                    text = ""
+                if text:
+                    text = self._strip_trailing_repeats(text)
+                if text and self._is_hallucination(text):
+                    LOG_MSG.debug("Hallucination filtered [%s]: '%s'", source, text)
+                    text = ""
+                if text:
+                    LOG_MSG.info("Whisper transcription result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed from audio")
+
+            except Exception as e:
+                LOG_MSG.error("Whisper transcription error: %s", e, exc_info=True)
+
+            self._process_queue.task_done()
+
+    @staticmethod
+    def _strip_trailing_repeats(text: str) -> str:
+        """
+        Collapse a single word repeated 3+ times at the tail down to one.
+        """
+        m = _TRAILING_WORD_RE.search(text)
+        if not m:
+            return text
+        result = (text[: m.start()].rstrip() + " " + m.group(1)).strip()
+        return result
+
+    @staticmethod
+    def _is_hallucination(text: str) -> bool:
+        t = text.lower().strip()
+        t_clean = re.sub(r'^[\W_]+|[\W_]+$', '', t)
+        if not t_clean:
+            return True
+        if _HALLUCINATION_RE.match(text):
+            return True
+        if t_clean in _HALLUCINATION_EXACT:
+            return True
+        words = t.split()
+        if len(words) >= 4:
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.35:
+                return True
+        return False
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False
+
+    def get_final_results(self):
+        if self._vad is not None:
+            remaining = self._vad.flush()
+            if remaining is not None:
+                self._enqueue_for_transcription(remaining, source='vad')
+        else:
+            self._flush_chunks_to_ring()
+            self._dispatch_to_worker()
+
+        self._process_queue.join()
+
+    def get_results(self):
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 sttgstwhisper.py — GStreamer/Whisper backend for IBus STT
 
