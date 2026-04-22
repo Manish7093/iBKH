@@ -1,3 +1,483 @@
+# sttvad.py
+"""
+Stream-oriented Voice Activity Detector with a three-tier backend hierarchy.
+
+Backend selection (in order of preference):
+  1. webrtcvad  – lightweight C extension, Google's production VAD
+  2. Energy     – pure numpy fallback, always available
+  3. Silero     – optional ML backend, only if STT_ENABLE_SILERO=1 is set
+                  AND torch + the pre-trusted local model are present.
+                  Never triggers a network call or interactive prompt.
+
+Feed float32 PCM (16 kHz, mono) via process().
+Complete speech segments are returned as numpy arrays.
+Call flush() before stopping to retrieve any trailing segment.
+"""
+
+import logging
+import numpy as np
+from collections import deque
+from abc import ABC, abstractmethod
+
+LOG_MSG = logging.getLogger()
+
+# ---------------------------------------------------------------------------
+# Abstract base for VAD backends
+# ---------------------------------------------------------------------------
+
+class _VadBackend(ABC):
+    """Minimal interface every backend must implement."""
+
+    CHUNK_SAMPLES: int  # number of samples per classify() call
+
+    @abstractmethod
+    def classify(self, chunk: np.ndarray) -> tuple[bool, float]:
+        """Return (is_speech, confidence)."""
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Reset any internal neural-network state."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Backend 1: webrtcvad
+# ---------------------------------------------------------------------------
+
+class _WebRtcVadBackend(_VadBackend):
+    """
+    Wraps python-webrtcvad (Google's WebRTC VAD).
+
+    Operates on 10 ms frames → 160 samples at 16 kHz.
+    Aggressiveness 2 is a good default: less aggressive than 3
+    (which tends to clip word beginnings) but more reliable than 1
+    in noisy desktop environments.
+    """
+
+    CHUNK_SAMPLES = 160   # 10 ms @ 16 kHz
+    SAMPLE_RATE   = 16000
+
+    def __init__(self, aggressiveness: int = 2):
+        import webrtcvad  # ImportError propagates → caller falls back
+        self._vad = webrtcvad.Vad(aggressiveness)
+
+    @property
+    def name(self) -> str:
+        return "webrtcvad"
+
+    def classify(self, chunk: np.ndarray) -> tuple[bool, float]:
+        # webrtcvad requires int16 PCM bytes
+        pcm = (chunk * 32767).astype(np.int16).tobytes()
+        try:
+            result = self._vad.is_speech(pcm, self.SAMPLE_RATE)
+            return result, 1.0 if result else 0.0
+        except Exception as exc:
+            LOG_MSG.warning("webrtcvad classify error: %s", exc)
+            return False, 0.0
+
+    def reset(self) -> None:
+        pass   # webrtcvad is stateless per-frame
+
+
+# ---------------------------------------------------------------------------
+# Backend 2: Energy-based (enhanced with spectral gate)
+# ---------------------------------------------------------------------------
+
+class _EnergyVadBackend(_VadBackend):
+    """
+    Pure-numpy fallback.  Always available.
+
+    Combines:
+    - Spectral gate: rejects sub-100 Hz dominated chunks (HVAC, mains hum)
+    - RMS threshold: simple amplitude check on broadband chunks
+    """
+
+    CHUNK_SAMPLES = 320   # 20 ms @ 16 kHz — good balance of latency vs accuracy
+    SAMPLE_RATE   = 16000
+
+    def __init__(
+        self,
+        rms_threshold:    float = 0.015,
+        freq_thold:       float = 100.0,
+        low_energy_ratio: float = 0.88,
+    ):
+        self._rms_threshold    = rms_threshold
+        self._freq_thold       = freq_thold
+        self._low_energy_ratio = low_energy_ratio
+
+    @property
+    def name(self) -> str:
+        return "energy-based VAD"
+
+    def classify(self, chunk: np.ndarray) -> tuple[bool, float]:
+        # Spectral gate first
+        if self._freq_thold > 0.0 and not self._spectral_gate(chunk):
+            return False, 0.0
+
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        return rms >= self._rms_threshold, rms
+
+    def reset(self) -> None:
+        pass   # stateless
+
+    def _spectral_gate(self, chunk: np.ndarray) -> bool:
+        n          = len(chunk)
+        fft_mag    = np.abs(np.fft.rfft(chunk))
+        freqs      = np.fft.rfftfreq(n, d=1.0 / self.SAMPLE_RATE)
+        energy_all = float(np.dot(fft_mag, fft_mag))
+
+        if energy_all < 1e-12:
+            return False   # silent → treat as no speech
+
+        low_mask   = freqs < self._freq_thold
+        energy_low = float(np.dot(fft_mag[low_mask], fft_mag[low_mask]))
+        return (energy_low / energy_all) < self._low_energy_ratio
+
+
+# ---------------------------------------------------------------------------
+# Backend 3: Silero (optional, explicitly opted-in)
+# ---------------------------------------------------------------------------
+
+class _SileroVadBackend(_VadBackend):
+    """
+    Silero VAD — optional ML backend.
+
+    ONLY instantiated when:
+      a) STT_ENABLE_SILERO=1 env var is set, OR
+         org.freedesktop.ibus.engine.stt silero-vad DCONF key is True
+      b) torch is installed
+      c) The model file exists at the pre-configured local path
+         (it must have been downloaded separately and placed there;
+          this class never triggers a network call or interactive prompt)
+
+    The local path avoids torch.hub's repository-trust prompt entirely.
+    torch.hub.load() with a local dir does not ask for trust confirmation.
+    """
+
+    CHUNK_SAMPLES = 512   # Silero requires exactly 512 samples @ 16 kHz
+    SAMPLE_RATE   = 16000
+    # Conventionally installed by the ibus-speech-to-text-silero subpackage
+    _DEFAULT_MODEL_DIR  = "/usr/share/ibus-stt/silero-vad"
+    _DEFAULT_MODEL_FILE = "silero_vad.jit"
+
+    def __init__(
+        self,
+        threshold:  float = 0.5,
+        model_dir:  str   = _DEFAULT_MODEL_DIR,
+        model_file: str   = _DEFAULT_MODEL_FILE,
+    ):
+        import torch                           # ImportError propagates → caller falls back
+        import os
+
+        model_path = os.path.join(model_dir, model_file)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Silero model not found at {model_path}. "
+                "Install ibus-speech-to-text-silero or set STT_SILERO_MODEL_PATH."
+            )
+
+        # Load from local path — this path does NOT trigger the trust prompt.
+        # torch.hub.load with source='local' or direct torch.jit.load works fine.
+        self._model = torch.jit.load(model_path, map_location="cpu")
+        self._model.eval()
+        self._torch     = torch
+        self._threshold = threshold
+        LOG_MSG.info("Silero VAD loaded from %s", model_path)
+
+    @property
+    def name(self) -> str:
+        return "Silero VAD"
+
+    def classify(self, chunk: np.ndarray) -> tuple[bool, float]:
+        try:
+            tensor = self._torch.from_numpy(chunk).unsqueeze(0)
+            with self._torch.no_grad():
+                prob = self._model(tensor, self.SAMPLE_RATE).item()
+            return prob >= self._threshold, prob
+        except Exception as exc:
+            LOG_MSG.warning("Silero inference error: %s", exc)
+            return False, 0.0
+
+    def reset(self) -> None:
+        try:
+            self._model.reset_states()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Backend factory
+# ---------------------------------------------------------------------------
+
+def _build_backend(prefer_silero: bool = False) -> _VadBackend:
+    """
+    Instantiate the best available backend.
+
+    Order when prefer_silero is False (default):
+        webrtcvad → energy
+
+    Order when prefer_silero is True (explicit opt-in):
+        Silero → webrtcvad → energy
+    """
+    candidates = []
+
+    if prefer_silero:
+        candidates.append(("Silero",    _SileroVadBackend,    {}))
+
+    candidates += [
+        ("webrtcvad", _WebRtcVadBackend, {"aggressiveness": 2}),
+        ("energy",    _EnergyVadBackend, {}),
+    ]
+
+    for label, cls, kwargs in candidates:
+        try:
+            backend = cls(**kwargs)
+            LOG_MSG.info("VAD backend selected: %s", backend.name)
+            return backend
+        except (ImportError, FileNotFoundError, Exception) as exc:
+            LOG_MSG.info("VAD backend '%s' unavailable: %s", label, exc)
+
+    # _EnergyVadBackend has no external deps — we should never reach here
+    raise RuntimeError("No VAD backend could be initialized (should be unreachable)")
+
+
+# ---------------------------------------------------------------------------
+# Public STTVad class  (same external API as before)
+# ---------------------------------------------------------------------------
+
+class STTVad:
+    """
+    Stream-oriented Voice Activity Detector.
+
+    External API is identical to the previous version so STTGstWhisper
+    requires zero changes.
+    """
+
+    SAMPLE_RATE = 16000
+
+    def __init__(
+        self,
+        speech_threshold:      float = 0.5,
+        silence_duration_ms:   int   = 600,
+        speech_pad_ms:         int   = 200,
+        min_speech_duration_ms: int  = 300,
+        max_speech_duration_s: float = 30.0,
+        freq_thold:            float = 100.0,
+        low_energy_ratio:      float = 0.88,
+        prefer_silero:         bool  = False,
+    ):
+        self._threshold = speech_threshold
+
+        self._silence_samples    = int(silence_duration_ms    * self.SAMPLE_RATE / 1000)
+        self._pad_samples        = int(speech_pad_ms          * self.SAMPLE_RATE / 1000)
+        self._min_speech_samples = int(min_speech_duration_ms * self.SAMPLE_RATE / 1000)
+        self._max_speech_samples = int(max_speech_duration_s  * self.SAMPLE_RATE)
+
+        self._backend = _build_backend(prefer_silero=prefer_silero)
+
+        chunk = self._backend.CHUNK_SAMPLES
+        pad_chunks = max(1, self._pad_samples // chunk)
+        self._pre_buf: deque = deque(maxlen=pad_chunks)
+
+        self._leftover       = np.empty(0, dtype=np.float32)
+        self._speech_chunks: list = []
+        self._speech_samples: int = 0
+        self._in_speech:      bool = False
+        self._silence_counter: int = 0
+
+        LOG_MSG.info(
+            "STTVad ready — backend: %s | chunk: %d samples",
+            self.backend_name, chunk,
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend.name
+
+    def reset(self) -> None:
+        self._pre_buf.clear()
+        self._leftover       = np.empty(0, dtype=np.float32)
+        self._speech_chunks  = []
+        self._speech_samples = 0
+        self._in_speech      = False
+        self._silence_counter = 0
+        self._backend.reset()
+
+    def process(self, audio: np.ndarray) -> list:
+        """Feed audio, return list of completed speech segments."""
+        completed = []
+        chunk_size = self._backend.CHUNK_SAMPLES
+
+        if len(self._leftover):
+            audio = np.concatenate([self._leftover, audio])
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        offset = 0
+        while offset + chunk_size <= len(audio):
+            chunk = audio[offset: offset + chunk_size]
+            offset += chunk_size
+
+            is_speech, confidence = self._backend.classify(chunk)
+
+            if is_speech:
+                self._on_speech_chunk(chunk, confidence, completed)
+            else:
+                self._on_silence_chunk(chunk, completed)
+
+        if offset < len(audio):
+            self._leftover = audio[offset:].copy()
+
+        return completed
+
+    def flush(self) -> "np.ndarray | None":
+        segment = None
+        if self._in_speech and self._speech_samples >= self._min_speech_samples:
+            parts = list(self._speech_chunks)
+            if len(self._leftover):
+                parts.append(self._leftover)
+            segment = np.concatenate(parts).astype(np.float32)
+            LOG_MSG.debug("VAD flush: %.2f s", len(segment) / self.SAMPLE_RATE)
+
+        self._speech_chunks  = []
+        self._speech_samples = 0
+        self._silence_counter = 0
+        self._in_speech      = False
+        self._leftover       = np.empty(0, dtype=np.float32)
+        return segment
+
+    # ------------------------------------------------------------------
+    # Internal helpers  (identical logic to before, just cleaner)
+    # ------------------------------------------------------------------
+
+    def _on_speech_chunk(self, chunk, confidence, out):
+        if not self._in_speech:
+            LOG_MSG.debug("VAD: speech onset (confidence=%.3f)", confidence)
+            self._in_speech      = True
+            self._silence_counter = 0
+            for pre in self._pre_buf:
+                self._speech_chunks.append(pre)
+                self._speech_samples += len(pre)
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples  += len(chunk)
+        self._silence_counter  = 0
+
+        if self._speech_samples >= self._max_speech_samples:
+            LOG_MSG.debug("VAD: max duration reached — intermediate flush")
+            segment = np.concatenate(self._speech_chunks).astype(np.float32)
+            out.append(segment)
+            self._speech_chunks  = []
+            self._speech_samples = 0
+
+    def _on_silence_chunk(self, chunk, out):
+        self._pre_buf.append(chunk)
+
+        if not self._in_speech:
+            return
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples  += len(chunk)
+        self._silence_counter += len(chunk)
+
+        if self._silence_counter >= self._silence_samples:
+            duration = self._speech_samples / self.SAMPLE_RATE
+            LOG_MSG.debug("VAD: speech end after %.2f s", duration)
+
+            if self._speech_samples >= self._min_speech_samples:
+                segment = np.concatenate(self._speech_chunks).astype(np.float32)
+                out.append(segment)
+            else:
+                LOG_MSG.debug("VAD: discarding short segment (%.3f s)", duration)
+
+            self._speech_chunks   = []
+            self._speech_samples  = 0
+            self._silence_counter = 0
+            self._in_speech       = False
+
+
+
+
+
+
+------------ STTGstWhisper.py ------
+# In STTGstWhisper.__init__, replace your existing STTVad() block with:
+
+import os as _os
+
+_prefer_silero = (
+    _os.environ.get("STT_ENABLE_SILERO", "0") == "1"
+    or self._settings.get_boolean("silero-vad")   # add this DCONF key
+)
+
+if VAD_MODULE_OK:
+    self._vad = STTVad(
+        speech_threshold=0.5,
+        silence_duration_ms=600,
+        speech_pad_ms=200,
+        min_speech_duration_ms=300,
+        max_speech_duration_s=15.0,
+        prefer_silero=_prefer_silero,
+    )
+    LOG_MSG.info("VAD active: %s", self._vad.backend_name)
+
+
+
+%package silero
+Summary:  Optional Silero VAD backend for ibus-speech-to-text
+Requires: %{name} = %{version}-%{release}
+Requires: python3-torch
+# The model file is bundled here — no runtime download ever occurs
+Source1:  silero_vad.jit   # pre-downloaded, pinned version
+
+%description silero
+Installs the Silero neural VAD model for improved voice activity
+detection accuracy. Requires PyTorch. Enable via:
+  gsettings set org.freedesktop.ibus.engine.stt silero-vad true
+
+%install
+# ... (existing install) ...
+install -Dm644 %{SOURCE1} \
+    %{buildroot}%{_datadir}/ibus-stt/silero-vad/silero_vad.jit
+
+%files silero
+%{_datadir}/ibus-stt/silero-vad/
+
+
+# Run once by the packager, output committed to the source tree or fetched as Source1
+python3 - <<'EOF'
+import torch, shutil, pathlib
+model, _ = torch.hub.load(
+    "snakers4/silero-vad", "silero_vad",
+    force_reload=True, onnx=False, trust_repo=True   # trust_repo=True suppresses prompt
+)
+# torch.jit.save produces a single portable .jit file — no torch.hub at runtime
+torch.jit.save(model, "silero_vad.jit")
+print("Model saved:", pathlib.Path("silero_vad.jit").stat().st_size, "bytes")
+EOF
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 IBus-Speech-To-Text$ /usr/libexec/ibus-engine-stt 
 The repository snakers4_silero-vad does not belong to the list of trusted repositories and as such cannot be downloaded. Do you trust this repository and wish to add it to the trusted list of repositories (y/N)?
 
