@@ -1,3 +1,590 @@
+import logging
+import os
+import numpy as np
+from collections import deque
+
+LOG_MSG = logging.getLogger()
+
+# ============================================================================
+# Backend identifiers
+# ============================================================================
+_BACKEND_SILERO_ONNX = "silero-onnx"
+_BACKEND_WEBRTC      = "webrtcvad"
+_BACKEND_ENERGY      = "energy"
+
+# ============================================================================
+# Backend detection -- runs ONCE at import time.
+# No network access. No interactive prompts. Every failure is logged, and
+# the final energy-based fallback is always available, so dictation never
+# breaks just because a higher-quality VAD is missing.
+# ============================================================================
+
+# --- Silero ONNX session (module-level so it's shared across instances) -----
+_ONNX_SESSION      = None
+_SILERO_ONNX_READY = False
+_SILERO_USES_V5    = False   # v5 uses a combined `state` tensor; v4 uses h/c
+
+
+def _find_silero_onnx_model():
+    """
+    Search standard locations for silero_vad.onnx.
+
+    Returns the first existing path found, or None.
+
+    Search order:
+      1. $SILERO_VAD_ONNX_PATH (admin / user override)
+      2. Inside the installed `silero_vad` pip package (data/ subfolder)
+      3. User cache      (~/.cache/silero-vad/silero_vad.onnx)
+      4. User share      (~/.local/share/silero-vad/silero_vad.onnx)
+      5. System share    (/usr/share/silero-vad/silero_vad.onnx)
+      6. Project share   (/usr/share/ibus-stt/vad/silero_vad.onnx)
+      7. /usr/local/share/silero-vad/silero_vad.onnx
+    """
+    candidates = []
+
+    env = os.environ.get("SILERO_VAD_ONNX_PATH")
+    if env:
+        candidates.append(env)
+
+    # Peek inside the `silero_vad` pip package for its bundled .onnx, if
+    # it happens to be installed. Importing the package is cheap and does
+    # NOT pull in torch (only the package's own __init__ runs).
+    try:
+        import silero_vad as _sv  # type: ignore
+        pkg_dir = os.path.dirname(os.path.abspath(_sv.__file__))
+        candidates.append(os.path.join(pkg_dir, "data", "silero_vad.onnx"))
+        candidates.append(os.path.join(pkg_dir, "silero_vad.onnx"))
+    except ImportError:
+        LOG_MSG.debug("STTVad: silero_vad python package not importable (ok)")
+    except Exception as exc:
+        LOG_MSG.debug("STTVad: silero_vad package probe raised (%s)", exc)
+
+    candidates.extend([
+        os.path.expanduser("~/.cache/silero-vad/silero_vad.onnx"),
+        os.path.expanduser("~/.local/share/silero-vad/silero_vad.onnx"),
+        "/usr/share/silero-vad/silero_vad.onnx",
+        "/usr/share/ibus-stt/vad/silero_vad.onnx",
+        "/usr/local/share/silero-vad/silero_vad.onnx",
+    ])
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _try_load_silero_onnx():
+    """Initialize the Silero VAD ONNX session. Returns True on success."""
+    global _ONNX_SESSION, _SILERO_ONNX_READY, _SILERO_USES_V5
+
+    LOG_MSG.info("STTVad: trying Silero ONNX backend...")
+
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        LOG_MSG.info(
+            "STTVad: onnxruntime not installed (%s). "
+            "Install 'python3-onnxruntime' (or `pip install onnxruntime`) "
+            "plus a silero_vad.onnx model for best VAD accuracy. "
+            "Trying next backend.", exc)
+        return False
+    except Exception as exc:
+        LOG_MSG.warning(
+            "STTVad: onnxruntime import raised unexpected error (%s). "
+            "Trying next backend.", exc)
+        return False
+
+    model_path = _find_silero_onnx_model()
+    if model_path is None:
+        LOG_MSG.info(
+            "STTVad: silero_vad.onnx not found. Checked: "
+            "$SILERO_VAD_ONNX_PATH, silero_vad pip package, "
+            "~/.cache/silero-vad, ~/.local/share/silero-vad, "
+            "/usr/share/silero-vad, /usr/share/ibus-stt/vad, "
+            "/usr/local/share/silero-vad. Trying next backend.")
+        return False
+
+    LOG_MSG.info("STTVad: found Silero ONNX model at %s", model_path)
+
+    try:
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.log_severity_level   = 3  # warnings and above only
+        session = ort.InferenceSession(
+            model_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as exc:
+        LOG_MSG.warning(
+            "STTVad: failed to create ONNX session for %s (%s). "
+            "Trying next backend.", model_path, exc)
+        return False
+
+    try:
+        input_names = {inp.name for inp in session.get_inputs()}
+    except Exception as exc:
+        LOG_MSG.warning(
+            "STTVad: could not introspect ONNX inputs (%s). "
+            "Trying next backend.", exc)
+        return False
+
+    # v5 models expose a combined "state" tensor; v4 exposes "h" and "c".
+    if "state" in input_names:
+        _SILERO_USES_V5 = True
+    elif "h" in input_names and "c" in input_names:
+        _SILERO_USES_V5 = False
+    else:
+        LOG_MSG.warning(
+            "STTVad: unrecognised Silero ONNX input signature %s. "
+            "Expected 'state' (v5) or 'h'+'c' (v4). Trying next backend.",
+            sorted(input_names))
+        return False
+
+    _ONNX_SESSION      = session
+    _SILERO_ONNX_READY = True
+    LOG_MSG.info(
+        "STTVad: Silero ONNX ready (model=%s, version=%s, inputs=%s)",
+        os.path.basename(model_path),
+        "v5" if _SILERO_USES_V5 else "v4",
+        sorted(input_names))
+    return True
+
+
+# --- webrtcvad fallback -----------------------------------------------------
+_WEBRTC_AVAILABLE = False
+
+
+def _try_load_webrtc():
+    global _WEBRTC_AVAILABLE
+    LOG_MSG.info("STTVad: trying webrtcvad backend...")
+
+    try:
+        import webrtcvad  # noqa: F401
+    except ImportError as exc:
+        LOG_MSG.info(
+            "STTVad: webrtcvad not installed (%s). "
+            "Install 'python3-webrtcvad' (or `pip install webrtcvad`) for a "
+            "lightweight alternative to Silero. Trying next backend.", exc)
+        return False
+    except Exception as exc:
+        LOG_MSG.warning(
+            "STTVad: webrtcvad import raised unexpected error (%s). "
+            "Trying next backend.", exc)
+        return False
+
+    _WEBRTC_AVAILABLE = True
+    LOG_MSG.info("STTVad: webrtcvad backend available")
+    return True
+
+
+# Probe each backend exactly once, at import time.
+_HAS_SILERO = _try_load_silero_onnx()
+_HAS_WEBRTC = _try_load_webrtc()
+
+if _HAS_SILERO:
+    _SELECTED_BACKEND = _BACKEND_SILERO_ONNX
+elif _HAS_WEBRTC:
+    _SELECTED_BACKEND = _BACKEND_WEBRTC
+else:
+    _SELECTED_BACKEND = _BACKEND_ENERGY
+    LOG_MSG.warning(
+        "STTVad: no advanced VAD backend available -- falling back to "
+        "energy-based threshold. Dictation will still work, but accuracy "
+        "in noisy environments is limited. Install either "
+        "'onnxruntime' + a silero_vad.onnx model, or 'webrtcvad', "
+        "to enable a higher-quality backend.")
+
+LOG_MSG.info("STTVad: selected backend = %s", _SELECTED_BACKEND)
+
+
+def get_active_backend():
+    """Expose the selected backend name for UI / diagnostics."""
+    return _SELECTED_BACKEND
+
+
+# ============================================================================
+# Public VAD class
+# ============================================================================
+
+class STTVad:
+    """
+    Stream-oriented Voice Activity Detector.
+
+    Backend selection at import time, in priority order:
+      1. Silero VAD via onnxruntime  (preferred -- most accurate, no PyTorch)
+      2. webrtcvad                   (lightweight, fast)
+      3. Energy-based threshold      (always-available final fallback)
+
+    Feed raw PCM float32 audio (16 kHz, mono) in arbitrary chunk sizes via
+    :meth:`process`. Complete speech *segments* (numpy float32 arrays) are
+    returned whenever an utterance ends. Call :meth:`flush` before stopping
+    to retrieve any incomplete final segment.
+
+    Parameters
+    ----------
+    speech_threshold : float
+        Silero confidence threshold in [0, 1]. Higher -> less sensitive.
+        Ignored by webrtcvad and energy backends (they have their own cut-off).
+    silence_duration_ms : int
+        Continuous silence (ms) required to mark the end of an utterance.
+    speech_pad_ms : int
+        Pre-speech padding (ms) prepended before detected speech onset.
+    min_speech_duration_ms : int
+        Segments shorter than this are discarded as noise.
+    max_speech_duration_s : float
+        Force-flush a segment if it grows beyond this length.
+    freq_thold : float
+        High-pass frequency threshold in Hz for the pre-filter (default 100 Hz).
+        Chunks whose energy is dominated by frequencies below this value
+        (>= low_energy_ratio of total energy) are rejected as non-speech
+        before any VAD backend is consulted. Mirrors vad_simple() freq_thold
+        in whisper.cpp stream.cpp. Set to 0.0 to disable.
+    low_energy_ratio : float
+        If the fraction of energy below freq_thold exceeds this value, the
+        chunk is treated as non-speech by the spectral gate. Default 0.88.
+    webrtc_aggressiveness : int
+        Used only when webrtcvad is the active backend. 0 is least aggressive
+        about filtering out non-speech, 3 is most aggressive. Default 2.
+    """
+
+    # Silero VAD requires exactly 512 samples per inference call at 16 kHz.
+    # webrtcvad accepts 10/20/30 ms frames -- we use 20 ms = 320 samples.
+    _SILERO_CHUNK_SAMPLES = 512
+    _WEBRTC_CHUNK_SAMPLES = 320
+    _ENERGY_CHUNK_SAMPLES = 320
+    SAMPLE_RATE           = 16000
+
+    def __init__(
+        self,
+        speech_threshold: float = 0.5,
+        silence_duration_ms: int = 600,
+        speech_pad_ms: int = 200,
+        min_speech_duration_ms: int = 300,
+        max_speech_duration_s: float = 30.0,
+        freq_thold: float = 100.0,
+        low_energy_ratio: float = 0.88,
+        webrtc_aggressiveness: int = 2,
+    ):
+        self._threshold        = speech_threshold
+        self._freq_thold       = freq_thold
+        self._low_energy_ratio = low_energy_ratio
+
+        self._silence_samples    = int(silence_duration_ms    * self.SAMPLE_RATE / 1000)
+        self._pad_samples        = int(speech_pad_ms          * self.SAMPLE_RATE / 1000)
+        self._min_speech_samples = int(min_speech_duration_ms * self.SAMPLE_RATE / 1000)
+        self._max_speech_samples = int(max_speech_duration_s  * self.SAMPLE_RATE)
+
+        self._backend = _SELECTED_BACKEND
+
+        if self._backend == _BACKEND_SILERO_ONNX:
+            self._chunk_size = self._SILERO_CHUNK_SAMPLES
+            self._init_silero_state()
+        elif self._backend == _BACKEND_WEBRTC:
+            self._chunk_size = self._WEBRTC_CHUNK_SAMPLES
+            self._init_webrtc(webrtc_aggressiveness)
+        else:
+            self._chunk_size = self._ENERGY_CHUNK_SAMPLES
+
+        # Pre-speech padding buffer sized in chunks.
+        pad_chunks = max(1, self._pad_samples // self._chunk_size)
+        self._pre_buf: deque = deque(maxlen=pad_chunks)
+
+        self._leftover        = np.empty(0, dtype=np.float32)
+        self._speech_chunks   = []
+        self._speech_samples  = 0
+        self._in_speech       = False
+        self._silence_counter = 0
+
+        LOG_MSG.info(
+            "STTVad ready -- backend=%s | chunk=%d samples | "
+            "silence=%dms | pad=%dms | min=%dms | max=%.1fs | "
+            "freq_thold=%.0fHz | low_energy_ratio=%.2f",
+            self.backend_name, self._chunk_size,
+            silence_duration_ms, speech_pad_ms,
+            min_speech_duration_ms, max_speech_duration_s,
+            self._freq_thold, self._low_energy_ratio)
+
+    # ------------------------------------------------------------------
+    # Backend initialisers
+    # ------------------------------------------------------------------
+    def _init_silero_state(self):
+        """Allocate fresh recurrent state for the Silero session."""
+        if _SILERO_USES_V5:
+            self._silero_state = np.zeros((2, 1, 128), dtype=np.float32)
+        else:
+            self._silero_h = np.zeros((2, 1, 64), dtype=np.float32)
+            self._silero_c = np.zeros((2, 1, 64), dtype=np.float32)
+        self._silero_sr = np.array(self.SAMPLE_RATE, dtype=np.int64)
+
+    def _init_webrtc(self, aggressiveness: int):
+        """Create a webrtcvad.Vad(), falling back to energy on failure."""
+        import webrtcvad
+        aggressiveness = max(0, min(3, int(aggressiveness)))
+        try:
+            self._webrtc_vad = webrtcvad.Vad(aggressiveness)
+            LOG_MSG.info(
+                "STTVad: webrtcvad initialised (aggressiveness=%d)",
+                aggressiveness)
+        except Exception as exc:
+            LOG_MSG.error(
+                "STTVad: webrtcvad.Vad(%d) failed (%s) -- demoting to "
+                "energy-based VAD for this instance.",
+                aggressiveness, exc)
+            self._webrtc_vad = None
+            self._backend    = _BACKEND_ENERGY
+            self._chunk_size = self._ENERGY_CHUNK_SAMPLES
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+    @property
+    def is_silero(self) -> bool:
+        """Kept for API compatibility with the previous implementation."""
+        return self._backend == _BACKEND_SILERO_ONNX
+
+    @property
+    def backend(self) -> str:
+        """One of: 'silero-onnx', 'webrtcvad', 'energy'."""
+        return self._backend
+
+    @property
+    def backend_name(self) -> str:
+        return {
+            _BACKEND_SILERO_ONNX: "Silero VAD (ONNX)",
+            _BACKEND_WEBRTC:      "WebRTC VAD",
+            _BACKEND_ENERGY:      "Energy-based VAD (fallback)",
+        }.get(self._backend, "Unknown")
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """Reset all internal state (call when starting a new recording)."""
+        self._pre_buf.clear()
+        self._leftover        = np.empty(0, dtype=np.float32)
+        self._speech_chunks   = []
+        self._speech_samples  = 0
+        self._in_speech       = False
+        self._silence_counter = 0
+        if self._backend == _BACKEND_SILERO_ONNX:
+            self._init_silero_state()
+
+    def process(self, audio: np.ndarray) -> list:
+        """
+        Feed incoming audio and return a list of completed speech segments.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Float32 PCM, 16 kHz, mono. Any length is accepted.
+
+        Returns
+        -------
+        list of np.ndarray
+            Zero or more completed speech segments ready for transcription.
+        """
+        completed_segments = []
+
+        if len(self._leftover):
+            audio = np.concatenate([self._leftover, audio])
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        offset = 0
+        while offset + self._chunk_size <= len(audio):
+            chunk   = audio[offset: offset + self._chunk_size]
+            offset += self._chunk_size
+
+            # Spectral gate runs first -- it is cheap (rfft of a few-hundred
+            # samples) and catches mains hum / HVAC rumble before we pay
+            # the cost of ONNX or webrtcvad inference.
+            if self._freq_thold > 0.0 and not self._spectral_gate(chunk):
+                self._on_silence_chunk(chunk, completed_segments)
+                continue
+
+            is_speech, confidence = self._classify_chunk(chunk)
+            if is_speech:
+                self._on_speech_chunk(chunk, confidence, completed_segments)
+            else:
+                self._on_silence_chunk(chunk, completed_segments)
+
+        if offset < len(audio):
+            self._leftover = audio[offset:].copy()
+        return completed_segments
+
+    def flush(self):
+        """
+        Flush remaining buffered speech. Call this when recording stops so
+        the last utterance is not lost.
+
+        Returns
+        -------
+        np.ndarray or None
+            A speech segment, or None if the buffer was empty / too short.
+        """
+        segment = None
+        if self._in_speech and self._speech_samples >= self._min_speech_samples:
+            parts = list(self._speech_chunks)
+            if len(self._leftover):
+                parts.append(self._leftover)
+            segment = np.concatenate(parts).astype(np.float32)
+            LOG_MSG.debug(
+                "VAD flush: %.2f s of speech emitted",
+                len(segment) / self.SAMPLE_RATE)
+
+        self._speech_chunks   = []
+        self._speech_samples  = 0
+        self._silence_counter = 0
+        self._in_speech       = False
+        self._leftover        = np.empty(0, dtype=np.float32)
+        return segment
+
+    # ------------------------------------------------------------------
+    # Spectral gate (mirrors vad_simple freq_thold in stream.cpp)
+    # ------------------------------------------------------------------
+    def _spectral_gate(self, chunk: np.ndarray) -> bool:
+        """
+        Return True when the chunk contains enough high-frequency energy
+        to plausibly be speech.
+        """
+        n            = len(chunk)
+        fft_mag      = np.abs(np.fft.rfft(chunk))
+        freqs        = np.fft.rfftfreq(n, d=1.0 / self.SAMPLE_RATE)
+        energy_total = float(np.dot(fft_mag, fft_mag))
+        if energy_total < 1e-12:
+            return False
+        low_mask    = freqs < self._freq_thold
+        energy_low  = float(np.dot(fft_mag[low_mask], fft_mag[low_mask]))
+        return (energy_low / energy_total) < self._low_energy_ratio
+
+    # ------------------------------------------------------------------
+    # Classification dispatch
+    # ------------------------------------------------------------------
+    def _classify_chunk(self, chunk):
+        """Return (is_speech: bool, confidence: float)."""
+        if self._backend == _BACKEND_SILERO_ONNX:
+            return self._silero_onnx_classify(chunk)
+        if self._backend == _BACKEND_WEBRTC:
+            return self._webrtc_classify(chunk)
+        return self._energy_classify(chunk)
+
+    def _silero_onnx_classify(self, chunk):
+        try:
+            audio = chunk.reshape(1, -1).astype(np.float32, copy=False)
+            if _SILERO_USES_V5:
+                prob, new_state = _ONNX_SESSION.run(None, {
+                    "input": audio,
+                    "state": self._silero_state,
+                    "sr":    self._silero_sr,
+                })
+                self._silero_state = new_state
+            else:
+                prob, new_h, new_c = _ONNX_SESSION.run(None, {
+                    "input": audio,
+                    "h":  self._silero_h,
+                    "c":  self._silero_c,
+                    "sr": self._silero_sr,
+                })
+                self._silero_h = new_h
+                self._silero_c = new_c
+            p = float(np.asarray(prob).flatten()[0])
+            return p >= self._threshold, p
+        except Exception as exc:
+            LOG_MSG.warning(
+                "STTVad: Silero ONNX inference error (%s) -- "
+                "using energy classify for this chunk", exc)
+            return self._energy_classify(chunk)
+
+    def _webrtc_classify(self, chunk):
+        if self._webrtc_vad is None:
+            return self._energy_classify(chunk)
+        try:
+            int16 = (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16)
+            frame = int16.tobytes()
+            is_speech = self._webrtc_vad.is_speech(frame, self.SAMPLE_RATE)
+            return bool(is_speech), (1.0 if is_speech else 0.0)
+        except Exception as exc:
+            LOG_MSG.warning(
+                "STTVad: webrtcvad error (%s) -- "
+                "using energy classify for this chunk", exc)
+            return self._energy_classify(chunk)
+
+    @staticmethod
+    def _energy_classify(chunk):
+        """
+        RMS energy threshold. The spectral gate already ran before this,
+        so here we only need a simple amplitude check. Typical quiet
+        background: ~0.003; typical speech: > 0.015.
+        """
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        return rms >= 0.015, rms
+
+    # ------------------------------------------------------------------
+    # Segment bookkeeping
+    # ------------------------------------------------------------------
+    def _on_speech_chunk(self, chunk, confidence, out_segments):
+        if not self._in_speech:
+            LOG_MSG.debug("VAD: speech onset (confidence=%.3f)", confidence)
+            self._in_speech       = True
+            self._silence_counter = 0
+            # Prepend padding: the last N silence chunks we were holding.
+            for pre_chunk in self._pre_buf:
+                self._speech_chunks.append(pre_chunk)
+                self._speech_samples += len(pre_chunk)
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples  += len(chunk)
+        self._silence_counter = 0
+
+        if self._speech_samples >= self._max_speech_samples:
+            LOG_MSG.debug(
+                "VAD: max duration (%.0f s) reached -- intermediate flush",
+                self._max_speech_samples / self.SAMPLE_RATE)
+            segment = np.concatenate(self._speech_chunks).astype(np.float32)
+            out_segments.append(segment)
+            self._speech_chunks  = []
+            self._speech_samples = 0
+
+    def _on_silence_chunk(self, chunk, out_segments):
+        # Maintain the rolling padding buffer at all times, so that a
+        # future onset gets the preceding silence prepended to it.
+        self._pre_buf.append(chunk)
+
+        if not self._in_speech:
+            return
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples  += len(chunk)
+        self._silence_counter += len(chunk)
+
+        if self._silence_counter >= self._silence_samples:
+            duration = self._speech_samples / self.SAMPLE_RATE
+            LOG_MSG.debug(
+                "VAD: speech end after %.2f s (silence threshold reached)",
+                duration)
+            if self._speech_samples >= self._min_speech_samples:
+                segment = np.concatenate(self._speech_chunks).astype(np.float32)
+                out_segments.append(segment)
+            else:
+                LOG_MSG.debug(
+                    "VAD: discarding short segment (%.3f s < %.3f s min)",
+                    duration,
+                    self._min_speech_samples / self.SAMPLE_RATE)
+            self._speech_chunks   = []
+            self._speech_samples  = 0
+            self._silence_counter = 0
+            self._in_speech       = False
+
+
+
+
+
+
+
+
+
+
 sttgstwhisper.py
 
 import logging
