@@ -1,3 +1,383 @@
+# sttvad.py
+
+import logging
+import numpy as np
+from collections import deque
+
+LOG_MSG = logging.getLogger()
+
+
+class STTVad:
+    """
+    Stream-oriented Voice Activity Detector (energy-based).
+
+    Feed raw PCM float32 audio (16 kHz, mono) in arbitrary chunk sizes via
+    :meth:`process`. Complete speech *segments* (numpy float32 arrays) are
+    returned whenever an utterance ends. Call :meth:`flush` before stopping
+    to retrieve any incomplete final segment.
+
+    Parameters
+    ----------
+    speech_threshold : float
+        Unused by the energy backend, kept for API compatibility.
+    silence_duration_ms : int
+        Continuous silence (ms) required to mark the end of an utterance.
+    speech_pad_ms : int
+        Pre-speech padding (ms) prepended before detected speech onset.
+    min_speech_duration_ms : int
+        Segments shorter than this are discarded as noise.
+    max_speech_duration_s : float
+        Force-flush a segment if it grows beyond this length.
+    freq_thold : float
+        High-pass frequency threshold in Hz (default 100 Hz).
+        Chunks dominated by energy below this value are rejected before
+        the RMS check. Set to 0.0 to disable.
+    low_energy_ratio : float
+        If the fraction of energy below freq_thold exceeds this value,
+        the chunk is treated as non-speech. Default 0.80.
+    rms_threshold : float
+        RMS amplitude a chunk must exceed to be considered speech.
+        Default 0.018. Raise this in noisier environments.
+    speech_confirm_chunks : int
+        Number of consecutive speech chunks required before onset is
+        declared. Acts as hysteresis: prevents a single noise spike from
+        triggering a segment. Default 3 (≈ 60 ms at 20 ms/chunk).
+    min_segment_rms : float
+        Minimum average RMS of the entire collected segment before it is
+        sent for transcription. Segments below this are discarded as
+        ambient noise that slipped through. Default 0.020.
+    webrtc_aggressiveness : int
+        Unused, kept for API compatibility.
+    """
+
+    _ENERGY_CHUNK_SAMPLES = 320   # 20 ms @ 16 kHz
+    SAMPLE_RATE           = 16000
+
+    def __init__(
+        self,
+        speech_threshold: float = 0.5,
+        silence_duration_ms: int = 600,
+        speech_pad_ms: int = 200,
+        min_speech_duration_ms: int = 300,
+        max_speech_duration_s: float = 30.0,
+        freq_thold: float = 100.0,
+        low_energy_ratio: float = 0.80,
+        rms_threshold: float = 0.018,
+        speech_confirm_chunks: int = 3,
+        min_segment_rms: float = 0.020,
+        webrtc_aggressiveness: int = 2,
+    ):
+        self._threshold            = speech_threshold
+        self._freq_thold           = freq_thold
+        self._low_energy_ratio     = low_energy_ratio
+        self._rms_threshold        = rms_threshold
+        self._speech_confirm_chunks = speech_confirm_chunks
+        self._min_segment_rms      = min_segment_rms
+
+        self._silence_samples    = int(silence_duration_ms    * self.SAMPLE_RATE / 1000)
+        self._pad_samples        = int(speech_pad_ms          * self.SAMPLE_RATE / 1000)
+        self._min_speech_samples = int(min_speech_duration_ms * self.SAMPLE_RATE / 1000)
+        self._max_speech_samples = int(max_speech_duration_s  * self.SAMPLE_RATE)
+
+        self._chunk_size = self._ENERGY_CHUNK_SAMPLES
+
+        pad_chunks = max(1, self._pad_samples // self._chunk_size)
+        self._pre_buf: deque = deque(maxlen=pad_chunks)
+
+        self._leftover          = np.empty(0, dtype=np.float32)
+        self._speech_chunks     = []
+        self._speech_samples    = 0
+        self._in_speech         = False
+        self._silence_counter   = 0
+        # Pending chunks accumulated during the confirmation window.
+        # They are only committed to _speech_chunks once onset is confirmed.
+        self._confirm_buf       = []
+        self._confirm_counter   = 0
+
+        LOG_MSG.info(
+            "STTVad ready -- backend=energy | chunk=%d samples | "
+            "silence=%dms | pad=%dms | min=%dms | max=%.1fs | "
+            "freq_thold=%.0fHz | low_energy_ratio=%.2f | "
+            "rms_thold=%.3f | confirm=%d chunks | min_seg_rms=%.3f",
+            self._chunk_size,
+            silence_duration_ms, speech_pad_ms,
+            min_speech_duration_ms, max_speech_duration_s,
+            self._freq_thold, self._low_energy_ratio,
+            self._rms_threshold, self._speech_confirm_chunks,
+            self._min_segment_rms)
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_silero(self) -> bool:
+        """Kept for API compatibility."""
+        return False
+
+    @property
+    def backend(self) -> str:
+        return "energy"
+
+    @property
+    def backend_name(self) -> str:
+        return "Energy-based VAD"
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Reset all internal state (call when starting a new recording)."""
+        self._pre_buf.clear()
+        self._leftover        = np.empty(0, dtype=np.float32)
+        self._speech_chunks   = []
+        self._speech_samples  = 0
+        self._in_speech       = False
+        self._silence_counter = 0
+        self._confirm_buf     = []
+        self._confirm_counter = 0
+
+    def process(self, audio: np.ndarray) -> list:
+        """
+        Feed incoming audio and return a list of completed speech segments.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Float32 PCM, 16 kHz, mono. Any length is accepted.
+
+        Returns
+        -------
+        list of np.ndarray
+            Zero or more completed speech segments ready for transcription.
+        """
+        completed_segments = []
+
+        if len(self._leftover):
+            audio = np.concatenate([self._leftover, audio])
+        self._leftover = np.empty(0, dtype=np.float32)
+
+        offset = 0
+        while offset + self._chunk_size <= len(audio):
+            chunk   = audio[offset: offset + self._chunk_size]
+            offset += self._chunk_size
+
+            # Spectral gate: reject chunks dominated by low-frequency energy
+            # (HVAC hum, mains noise, DC offset) before RMS check.
+            if self._freq_thold > 0.0 and not self._spectral_gate(chunk):
+                self._on_silence_chunk(chunk, completed_segments)
+                continue
+
+            is_speech, confidence = self._energy_classify(chunk)
+            if is_speech:
+                self._on_speech_chunk(chunk, confidence, completed_segments)
+            else:
+                self._on_silence_chunk(chunk, completed_segments)
+
+        if offset < len(audio):
+            self._leftover = audio[offset:].copy()
+
+        return completed_segments
+
+    def flush(self):
+        """
+        Flush remaining buffered speech. Call when recording stops so
+        the last utterance is not lost.
+
+        Returns
+        -------
+        np.ndarray or None
+            A speech segment, or None if the buffer was empty / too short.
+        """
+        # Discard any unconfirmed onset — it was too short to be real speech.
+        self._confirm_buf     = []
+        self._confirm_counter = 0
+
+        segment = None
+        if self._in_speech and self._speech_samples >= self._min_speech_samples:
+            parts = list(self._speech_chunks)
+            if len(self._leftover):
+                parts.append(self._leftover)
+            candidate = np.concatenate(parts).astype(np.float32)
+            if self._segment_passes_rms(candidate):
+                segment = candidate
+                LOG_MSG.debug(
+                    "VAD flush: %.2f s of speech emitted",
+                    len(segment) / self.SAMPLE_RATE)
+            else:
+                LOG_MSG.debug(
+                    "VAD flush: segment discarded (RMS too low — likely noise)")
+
+        self._speech_chunks   = []
+        self._speech_samples  = 0
+        self._silence_counter = 0
+        self._in_speech       = False
+        self._leftover        = np.empty(0, dtype=np.float32)
+        return segment
+
+    # ------------------------------------------------------------------
+    # Spectral gate
+    # ------------------------------------------------------------------
+
+    def _spectral_gate(self, chunk: np.ndarray) -> bool:
+        """
+        Return True when the chunk contains enough high-frequency energy
+        to plausibly be speech.
+        """
+        n            = len(chunk)
+        fft_mag      = np.abs(np.fft.rfft(chunk))
+        freqs        = np.fft.rfftfreq(n, d=1.0 / self.SAMPLE_RATE)
+        energy_total = float(np.dot(fft_mag, fft_mag))
+        if energy_total < 1e-12:
+            return False
+        low_mask   = freqs < self._freq_thold
+        energy_low = float(np.dot(fft_mag[low_mask], fft_mag[low_mask]))
+        return (energy_low / energy_total) < self._low_energy_ratio
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
+
+    def _energy_classify(self, chunk: np.ndarray) -> tuple:
+        """
+        RMS energy threshold. The spectral gate already ran before this.
+        Typical quiet background: ~0.003; typical speech: > 0.018.
+        """
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        return rms >= self._rms_threshold, rms
+
+    # ------------------------------------------------------------------
+    # Segment-level RMS gate
+    # ------------------------------------------------------------------
+
+    def _segment_passes_rms(self, segment: np.ndarray) -> bool:
+        """
+        Final guard before a completed segment is emitted for transcription.
+
+        Even if individual chunks passed the per-chunk RMS threshold, a
+        segment assembled mostly from near-threshold chunks may still be
+        mostly noise. Requiring the whole-segment average to exceed
+        min_segment_rms catches these cases.
+        """
+        if self._min_segment_rms <= 0.0:
+            return True
+        rms = float(np.sqrt(np.mean(segment ** 2)))
+        if rms < self._min_segment_rms:
+            LOG_MSG.debug(
+                "VAD: segment RMS %.4f < min %.4f — discarding", rms, self._min_segment_rms)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Segment bookkeeping
+    # ------------------------------------------------------------------
+
+    def _on_speech_chunk(self, chunk, confidence, out_segments):
+        if not self._in_speech:
+            # Accumulate into the confirmation buffer first.
+            # Only declare onset once speech_confirm_chunks consecutive
+            # speech chunks have been seen. This prevents a single noise
+            # spike from triggering a whole transcription round-trip.
+            self._confirm_buf.append(chunk)
+            self._confirm_counter += 1
+
+            if self._confirm_counter < self._speech_confirm_chunks:
+                # Not yet confirmed — keep collecting silently.
+                return
+
+            # Onset confirmed. Commit padding + confirmation buffer.
+            LOG_MSG.debug(
+                "VAD: speech onset confirmed after %d chunks (confidence=%.3f)",
+                self._confirm_counter, confidence)
+            self._in_speech       = True
+            self._silence_counter = 0
+
+            for pre_chunk in self._pre_buf:
+                self._speech_chunks.append(pre_chunk)
+                self._speech_samples += len(pre_chunk)
+
+            for buffered in self._confirm_buf:
+                self._speech_chunks.append(buffered)
+                self._speech_samples += len(buffered)
+
+            self._confirm_buf     = []
+            self._confirm_counter = 0
+
+        else:
+            # Already in speech — append directly.
+            self._speech_chunks.append(chunk)
+            self._speech_samples  += len(chunk)
+            self._silence_counter  = 0
+
+            if self._speech_samples >= self._max_speech_samples:
+                LOG_MSG.debug(
+                    "VAD: max duration (%.0f s) reached -- intermediate flush",
+                    self._max_speech_samples / self.SAMPLE_RATE)
+                candidate = np.concatenate(self._speech_chunks).astype(np.float32)
+                if self._segment_passes_rms(candidate):
+                    out_segments.append(candidate)
+                self._speech_chunks  = []
+                self._speech_samples = 0
+
+    def _on_silence_chunk(self, chunk, out_segments):
+        # A silence chunk during the confirmation window resets the counter
+        # — the burst was not sustained enough to be speech.
+        if not self._in_speech:
+            if self._confirm_counter > 0:
+                LOG_MSG.debug(
+                    "VAD: onset aborted (%d/%d confirm chunks) — noise spike rejected",
+                    self._confirm_counter, self._speech_confirm_chunks)
+                self._confirm_buf     = []
+                self._confirm_counter = 0
+            self._pre_buf.append(chunk)
+            return
+
+        self._speech_chunks.append(chunk)
+        self._speech_samples  += len(chunk)
+        self._silence_counter += len(chunk)
+
+        if self._silence_counter >= self._silence_samples:
+            duration = self._speech_samples / self.SAMPLE_RATE
+            LOG_MSG.debug(
+                "VAD: speech end after %.2f s (silence threshold reached)", duration)
+
+            if self._speech_samples >= self._min_speech_samples:
+                candidate = np.concatenate(self._speech_chunks).astype(np.float32)
+                if self._segment_passes_rms(candidate):
+                    out_segments.append(candidate)
+                else:
+                    LOG_MSG.debug("VAD: segment discarded at RMS gate")
+            else:
+                LOG_MSG.debug(
+                    "VAD: discarding short segment (%.3f s < %.3f s min)",
+                    duration, self._min_speech_samples / self.SAMPLE_RATE)
+
+            self._speech_chunks   = []
+            self._speech_samples  = 0
+            self._silence_counter = 0
+            self._in_speech       = False
+            self._pre_buf.append(chunk)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --------- enery based vad only ------------
 
 
