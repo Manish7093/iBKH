@@ -1,4 +1,121 @@
 
+sttgstmoonshine.py
+
+class _LineListener(TranscriptEventListener):
+    """Commit only *completed* Moonshine lines as dictated text.
+
+    Partials are deliberately ignored: routing them through the same "text"
+    channel re-inserts the growing prefix on every update, which makes a word
+    or sentence appear 2-3 times. We also guard against the same line being
+    completed twice (once while streaming, once when stop() flushes).
+    """
+
+    def __init__(self, engine):
+        if MOONSHINE_AVAILABLE:
+            super().__init__()
+        self._engine = engine
+        self._emitted_ids = set()
+
+    def reset(self):
+        self._emitted_ids.clear()
+
+    def on_line_completed(self, event):
+        line = event.line
+        line_id = id(line)
+        if line_id in self._emitted_ids:
+            return
+        self._emitted_ids.add(line_id)
+        text = (line.text or "").strip()
+        if text:
+            LOG_MSG.info("Moonshine transcription result: '%s'", text)
+            GLib.idle_add(self._engine._emit_text, text)
+
+    # on_line_text_changed intentionally not implemented — partials are not committed.
+
+--------------------
+
+In __init__, add the stop flag alongside the other session attributes:
+self._tx_lock = threading.Lock()
+        self._session_active = False
+        self._stopping = False
+---------------
+In _on_new_sample, drop trailing buffers while finalizing (guard at the very top):
+
+def _on_new_sample(self, appsink):
+        # While finalizing, ignore trailing buffers; replaying the tail of a
+        # finished utterance as a fresh session duplicates/hallucinates text.
+        if getattr(self, "_stopping", False):
+            return Gst.FlowReturn.OK
+
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+----------------------------------------
+
+In _process_worker, reset the dedup state when a new session starts:
+
+if cmd == "audio":
+                        if not self._session_active:
+                            transcriber.start()
+                            if self._listener is not None:
+                                self._listener.reset()
+                            self._session_active = True
+                        transcriber.add_audio(payload, SAMPLE_RATE)
+
+---------------------------
+Replace _stop_real so the tail-drop window is held open across the flush and pipeline
+
+def _stop_real(self):
+        self._stopping = True
+        try:
+            self.get_final_results()
+            return super()._stop_real()
+        finally:
+            self._stopping = False
+
+------------------------------
+
+
+
+
+
+
+engine/sttconfigdialog.py
+
+backend = self._settings.get_string("backend")
+        if backend == "moonshine":
+            supported = stt_moonshine_online_model_manager().supported_locales()
+        else:
+            supported = stt_vosk_online_model_manager().supported_locales()
+        _EXCLUDED = {"multilingual"}
+
+
+engine/sttmoonshinemodelmanagers.py 
+
+try:
+    from moonshine_voice import ModelArch
+    from moonshine_voice.download import (
+        MODEL_INFO,
+        find_model_info,
+        get_components_for_model_info,
+        get_model_for_language,
+    )
+    from moonshine_voice.download_file import get_cache_dir
+    MOONSHINE_AVAILABLE = True
+except Exception as e:   # not just ImportError: a missing symbol must not nuke the catalog
+    LOG_MSG.warning("moonshine_voice model catalog unavailable (%s). "
+                    "Install/upgrade with: pip install -U moonshine-voice", e)
+    MOONSHINE_AVAILABLE = False
+    MODEL_INFO = {}
+    ModelArch = None
+
+
+
+
+
+
+
+
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Itachi <itachi@example.com>
 Date: Mon, 16 Jun 2026 00:00:00 +0530
