@@ -1,3 +1,34 @@
+silero onnxasr
+
+self._vad = None
+        if ONNXASR_AVAILABLE:
+            try:
+                self._vad = onnx_asr.load_vad("silero")
+            except Exception as e:
+                LOG_MSG.warning("Could not load Silero VAD, falling back to plain chunking: %s", e)
+                self._vad = None
+
+
+
+model = onnx_asr.load_model(model_name)
+            self._recognizer = model.with_vad(self._vad) if self._vad is not None else model
+
+
+result = recognizer.recognize(audio, sample_rate=self._sample_rate)
+
+                if isinstance(result, str):
+                    segments = [result]
+                else:
+                    segments = [seg.text for seg in result]   # VAD: SegmentResult iterator
+
+                for text in segments:
+                    text = (text or "").strip()
+                    if text:
+                        LOG_MSG.info("onnx-asr transcription result: '%s'", text)
+                        GLib.idle_add(self._emit_text, text)
+
+
+
 ------ auditok---------
 
 # sttvad.py
