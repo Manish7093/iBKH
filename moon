@@ -1,4 +1,69 @@
 
+
+def _process_worker(self):
+        """Feed queued audio into the Moonshine transcriber.
+
+        Pending audio chunks are coalesced into a single add_audio() call:
+        this cuts per-call and lock overhead and lets the model catch up when
+        inference falls behind real time, without dropping any audio. Ordering
+        (audio... then stop) is preserved.
+        """
+        while not self._stop_processing:
+            try:
+                cmd, payload = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            pending_done = 1          # queue items to ack (must match get()s)
+            audio_batch = None
+            stop_requested = False
+
+            if cmd == "audio":
+                audio_batch = [payload]
+                while True:
+                    try:
+                        ncmd, npayload = self._process_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    pending_done += 1
+                    if ncmd == "audio":
+                        audio_batch.append(npayload)
+                    else:                      # stop: flush batched audio first
+                        stop_requested = True
+                        break
+            elif cmd == "stop":
+                stop_requested = True
+
+            try:
+                with self._tx_lock:
+                    transcriber = self._transcriber
+                    if transcriber is not None:
+                        if audio_batch:
+                            if not self._session_active:
+                                transcriber.start()
+                                if self._listener is not None:
+                                    self._listener.reset()
+                                self._session_active = True
+                            chunk = (audio_batch[0] if len(audio_batch) == 1
+                                     else np.concatenate(audio_batch))
+                            transcriber.add_audio(chunk, SAMPLE_RATE)
+                        if stop_requested and self._session_active:
+                            transcriber.stop()
+                            self._session_active = False
+            except Exception as e:
+                LOG_MSG.error("Moonshine processing error: %s", e, exc_info=True)
+            finally:
+                for _ in range(pending_done):
+                    self._process_queue.task_done()
+
+
+
+
+
+
+
+
+
 sttgstmoonshine.py
 
 class _LineListener(TranscriptEventListener):
