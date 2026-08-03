@@ -1,3 +1,29 @@
+
+from sttbackenddeps import (stt_backend_display_name,
+                            stt_backend_install_command,
+                            stt_backend_is_available)
+
+
+
+# Check backend setting
+            backend = self.__settings.get_string("backend")
+
+            # This process reads the same GSettings key as the setup dialog but
+            # starts long before anyone opens it: refuse a backend whose python
+            # module is missing, or the input method comes up mute with only
+            # "engine has no valid model" to show for it.
+            if not stt_backend_is_available(backend):
+                LOG_MSG.error("%s backend is selected but not installed. "
+                              "Install it with: %s",
+                              stt_backend_display_name(backend),
+                              stt_backend_install_command(backend))
+                LOG_MSG.error("falling back to the Vosk backend")
+                backend = "vosk"
+
+            if backend == "whisper":
+
+
+
 def _populate_locale_list(self):
         self._locale_list.clear()
         self._locale_names = Gtk.StringList()
