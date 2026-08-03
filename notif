@@ -1,3 +1,89 @@
+self._destroyed = False          # next to self._stopping = False
+
+def __del__(self):
+        try:
+            self._stop_processing = True
+            thread = self._process_thread
+            self._process_thread = None
+            if thread is not None:
+                thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            super().__del__()
+        except (AttributeError, TypeError):
+            pass
+
+    def destroy(self):
+        # release() can reach destroy() twice, because the factory hands this
+        # object back out while it is still alive. Without the guard the second
+        # pass disconnects handler id 0 and dereferences a bus already set to
+        # None by the base class.
+        if self._destroyed:
+            LOG_MSG.debug("Moonshine engine already destroyed")
+            return
+        self._destroyed = True
+
+        self._stop_processing = True
+
+        # Drop the reference before joining. Thread(target=self._process_worker)
+        # keeps a bound method alive, so engine -> thread -> engine is a cycle
+        # and the engine would only be freed on the next gc pass. Meanwhile
+        # sttgstfactory holds it through a weakref and would keep serving this
+        # destroyed instance to every new STTEngine. Vosk and Whisper have no
+        # worker thread, which is why they never hit this.
+        thread = self._process_thread
+        self._process_thread = None
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                LOG_MSG.warning("Moonshine worker thread did not stop in time")
+
+        if self._locale_id != 0:
+            self._current_locale.disconnect(self._locale_id)
+            self._locale_id = 0
+
+        if self._model_id != 0 and self._model is not None:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        with self._tx_lock:
+            self._teardown_transcriber()
+
+        # Was self._new_sample_id: a typo meant the handler was never
+        # disconnected, leaving appsink -> bound method -> engine alive too.
+        if self._appsink is not None and self._on_new_sample_id != 0:
+            self._appsink.disconnect(self._on_new_sample_id)
+            self._on_new_sample_id = 0
+        self._appsink = None
+
+        LOG_MSG.info("Moonshine.destroy() called")
+        super().destroy()
+
+
+
+engine = None if self._current_engine is None else self._current_engine()
+        if engine is not None and engine.pipeline is None:
+            LOG_MSG.debug("cached engine was already destroyed, creating a new one")
+            engine = None
+        if engine is None:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # vim:set et sts=4 sw=4:
 #
 # ibus-stt - Speech To Text engine for IBus
