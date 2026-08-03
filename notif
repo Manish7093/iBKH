@@ -1,3 +1,59 @@
+def _populate_locale_list(self):
+        self._locale_list.clear()
+        self._locale_names = Gtk.StringList()
+
+        backend = self._backend()
+
+        # Only Moonshine ships a language list of its own; every other backend
+        # is driven by the Vosk catalogue, as before.
+        if backend == "moonshine" and stt_backend_is_available(backend):
+            manager = stt_backend_model_manager("moonshine")
+        else:
+            manager = stt_backend_model_manager("vosk")
+
+        supported = manager.supported_locales() if manager is not None else []
+
+        _EXCLUDED = {"multilingual"}
+        supported = [loc for loc in supported if loc not in _EXCLUDED]
+
+        # Moonshine keys its catalog by bare language codes ("en") whereas Vosk
+        # uses full locales ("en_us"): compare the language part only.
+        supported_langs = {loc[0:2].lower() for loc in supported}
+
+        def _is_supported(locale_str):
+            if locale_str in (None, "", "None", "multilingual"):
+                return False
+            if not supported:
+                # Backend advertises nothing (typically not installed): keep
+                # the previous behaviour rather than an empty dropdown.
+                return True
+            return locale_str[0:2].lower() in supported_langs
+
+        system_locale_str = locale.getlocale()[0]
+        if _is_supported(system_locale_str):
+            self._append_locale_option(system_locale_str)
+
+        if (self._current_locale.locale != system_locale_str
+                and _is_supported(self._current_locale.locale)):
+            self._append_locale_option(self._current_locale.locale)
+
+        known_langs = {loc[0:2].lower() for loc in self._locale_list}
+
+        for loc in sorted(supported):
+            if loc in self._locale_list:
+                continue
+            if loc[0:2].lower() in known_langs:
+                continue
+            self._append_locale_option(loc)
+            known_langs.add(loc[0:2].lower())
+
+
+
+
+
+
+
+
 _LISTENER_CLASS = None
 
 
