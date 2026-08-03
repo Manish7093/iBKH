@@ -1,3 +1,233 @@
+
+MOONSHINE_AVAILABLE = False
+MODEL_INFO = {}
+ModelArch = None
+find_model_info = None
+get_components_for_model_info = None
+get_model_for_language = None
+get_cache_dir = None
+
+
+def stt_moonshine_ensure_available(force=False):
+    """(Re)try importing moonshine_voice and publish its catalog symbols.
+
+    This module can be imported (through sttmodelchooserdialog) long before
+    moonshine-voice is installed.  Binding the symbols in a function instead
+    of at import time means a module installed while the process is running
+    is picked up on the next call, rather than staying disabled until restart.
+    """
+    global MOONSHINE_AVAILABLE, MODEL_INFO, ModelArch
+    global find_model_info, get_components_for_model_info
+    global get_model_for_language, get_cache_dir
+
+    if MOONSHINE_AVAILABLE and not force:
+        return True
+
+    try:
+        # Needed so that a package installed after start-up is found.
+        importlib.invalidate_caches()
+
+        from moonshine_voice import ModelArch as _ModelArch
+        from moonshine_voice.download import (
+            MODEL_INFO as _MODEL_INFO,
+            find_model_info as _find_model_info,
+            get_components_for_model_info as _get_components,
+            get_model_for_language as _get_model_for_language,
+        )
+        from moonshine_voice.download_file import get_cache_dir as _get_cache_dir
+    except Exception as e:
+        LOG_MSG.warning("moonshine_voice model catalog unavailable (%s). "
+                        "Install/upgrade with: pip install -U moonshine-voice", e)
+        MOONSHINE_AVAILABLE = False
+        MODEL_INFO = {}
+        ModelArch = None
+        return False
+
+    ModelArch = _ModelArch
+    MODEL_INFO = _MODEL_INFO
+    find_model_info = _find_model_info
+    get_components_for_model_info = _get_components
+    get_model_for_language = _get_model_for_language
+    get_cache_dir = _get_cache_dir
+    MOONSHINE_AVAILABLE = True
+    LOG_MSG.debug("moonshine_voice catalog loaded (%d languages)",
+                  len(MODEL_INFO))
+    return True
+
+
+# Harmless if it fails here; it is retried on demand.
+stt_moonshine_ensure_available()
+
+
+def refresh(self):
+        if not stt_moonshine_ensure_available():
+            return False
+        if self._present:
+            return True
+        self._scan_present_models()
+        return True
+
+
+
+def refresh(self):
+        """Rebuild the catalog if it was built while moonshine_voice
+        was not importable."""
+        if not stt_moonshine_ensure_available():
+            return False
+        if self._models:
+            return True
+
+        stt_moonshine_local_model_manager().refresh()
+        self._models = {}
+        self._locales_dict = {}
+        self._build_catalog()
+        LOG_MSG.debug("moonshine catalog rebuilt (%d models, %d locales)",
+                      len(self._models), len(self._locales_dict))
+        return bool(self._models)
+
+    def supported_locales(self):
+        self.refresh()
+        return list(self._locales_dict.keys())
+
+
+
+
+import sttmoonshinemodelmanagers
+
+from sttmoonshinemodelmanagers import (
+    stt_moonshine_local_model_manager,
+    stt_moonshine_ensure_available,
+)
+
+
+
+self._model_arch = (local._infer_arch_for_folder(model)
+                                if sttmoonshinemodelmanagers.MOONSHINE_AVAILABLE
+                                else None)
+
+
+
+"moonshine": {
+        "name": "Moonshine",
+        "dependencies": (
+            STTBackendDependency("moonshine_voice", "moonshine-voice"),
+        ),
+        "ensure": ("sttmoonshinemodelmanagers", "stt_moonshine_ensure_available"),
+        "components": {
+            "engine":  ("sttgstmoonshine", "STTGstMoonshine"),
+            "model":   ("sttmoonshinemodel", "STTMoonshineModel"),
+            "manager": ("sttmoonshinemodelmanagers", "stt_moonshine_online_model_manager"),
+        },
+    },
+
+
+
+def stt_backend_refresh(backend):
+    """Re-arm a backend after its dependencies appeared at runtime.
+
+    A module of ours may have been imported before the third party package
+    was installed and cached a "not available" state; this asks it to try
+    again and to rebuild whatever it built empty.
+    """
+    if not stt_backend_is_available(backend, refresh=True):
+        return False
+
+    entry = _BACKENDS.get(backend)
+    if entry is None:
+        return False
+
+    location = entry.get("ensure")
+    if location is not None:
+        module_name, attribute = location
+        try:
+            ensure = getattr(importlib.import_module(module_name), attribute)
+            ensure(force=True)
+        except Exception as error:
+            LOG_MSG.warning("cannot re-arm backend %s (%s)", backend, error)
+            return False
+
+    manager = stt_backend_model_manager(backend)
+    if manager is not None and hasattr(manager, "refresh"):
+        try:
+            manager.refresh()
+        except Exception as error:
+            LOG_MSG.warning("cannot refresh catalog of %s (%s)", backend, error)
+
+    return True
+
+
+
+
+if not stt_backend_is_available(backend, refresh=True):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title=_("%s is still not installed")
+                          % stt_backend_display_name(backend), timeout=5))
+            return
+
+        # The module appeared while we were running: let the backend rebuild
+        # whatever it initialised empty before it was installed.
+        stt_backend_refresh(backend)
+
+        self._update_backend_rows()
+
+
+
+
+if self._model is None:
+            stt_backend_refresh(backend)
+            self._reload_backend()
+
+
+
+backend = self._backend()
+        if backend == "moonshine" and stt_backend_is_available(backend):
+            stt_backend_refresh(backend)
+            manager = stt_backend_model_manager("moonshine")
+        else:
+            manager = stt_backend_model_manager("vosk")
+
+        supported = manager.supported_locales() if manager is not None else []
+
+        _EXCLUDED = {"multilingual"}
+
+        # Moonshine keys its catalog by bare language codes ("en") whereas the
+        # entries added above are full locales ("en_US"): avoid listing the
+        # same language twice.
+        known_langs = {loc[0:2].lower() for loc in self._locale_list}
+
+        for loc in sorted(supported):
+            if loc in _EXCLUDED:
+                continue
+            if loc in self._locale_list:
+                continue
+            if len(loc) == 2 and loc.lower() in known_langs:
+                continue
+            self._append_locale_option(loc)
+            known_langs.add(loc[0:2].lower())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # vim:set et sts=4 sw=4:
 #
 # ibus-stt - Speech To Text engine for IBus
