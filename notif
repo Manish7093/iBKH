@@ -1,3 +1,352 @@
+from sttbackenddeps import (STT_DEFAULT_BACKEND,
+                            stt_backend_component,
+                            stt_backend_display_name,
+                            stt_backend_install_command,
+                            stt_backend_is_available,
+                            stt_backend_missing_dependencies,
+                            stt_backend_model_manager,
+                            stt_invalidate_availability_cache)
+
+
+
+
+# Modules are installed and removed in a terminal: re-check when the
+        # window comes back to the front rather than waiting for a click on a
+        # backend row, which never happens for the backend already selected.
+        self._backend_was_available = stt_backend_is_available(self._backend())
+        self.connect("notify::is-active", self._window_active_cb)
+
+    def _window_active_cb(self, *_args):
+        if not self.get_property("is-active"):
+            return
+
+        stt_invalidate_availability_cache()
+        available = stt_backend_is_available(self._backend())
+        if available == self._backend_was_available:
+            self._update_backend_rows()
+            return
+
+        self._backend_was_available = available
+        self._reload_backend()
+
+
+
+
+
+def moonshine_installed():
+    # PathFinder, not importlib.util.find_spec(): once moonshine_voice has been
+    # imported find_spec() answers from sys.modules and would keep reporting a
+    # removed package as present.
+    try:
+        if importlib.machinery.PathFinder.find_spec("moonshine_voice", sys.path):
+            return True
+        importlib.invalidate_caches()
+        return bool(importlib.machinery.PathFinder.find_spec("moonshine_voice",
+                                                             sys.path))
+    except (ImportError, ValueError, TypeError, AttributeError) as error:
+        LOG_MSG.debug("cannot look up moonshine_voice (%s)", error)
+        return False
+
+
+
+def _catalog():
+    global _CATALOG, _CATALOG_LOCALES
+
+    # Checked first: the package may have gone away since we cached the catalog.
+    if not moonshine_installed():
+        _CATALOG = None
+        _CATALOG_LOCALES = None
+        return {}, {}
+
+    if _CATALOG is not None:
+        return _CATALOG, _CATALOG_LOCALES
+    ...
+
+
+
+catalog, locales = _catalog()
+        if not catalog:
+            self._models = {}
+            self._locales_dict = {}
+            return
+        if len(self._models) == len(catalog):
+            return
+
+
+
+
+
+
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Description of the recognition backends and of their optional dependencies.
+
+Vosk and Whisper are expected to be installed along with the engine, whereas
+onnx-asr and Moonshine rely on third party python modules the user has to
+install themselves.  Everything the UI needs to know about a backend - its
+display name, the modules it needs, the classes implementing it - is kept
+here so that adding a backend does not mean touching a dozen if/elif chains.
+
+Availability is tested by looking the module up on sys.path without executing
+it, which keeps the check cheap enough to be called from UI code and lets both
+an installation and a removal made while we are running be noticed.
+"""
+
+import importlib
+import importlib.machinery
+import importlib.util
+import logging
+import sys
+
+LOG_MSG = logging.getLogger()
+
+
+class STTBackendDependency:
+    """A single third party python module a backend needs at runtime."""
+
+    def __init__(self, module, distribution, extras=None):
+        # Import name, e.g. "onnx_asr"
+        self.module = module
+        # PyPI name, e.g. "onnx-asr"
+        self.distribution = distribution
+        # PyPI extras, e.g. ("cpu", "hub")
+        self.extras = tuple(extras) if extras is not None else ()
+
+    @property
+    def requirement(self):
+        if not self.extras:
+            return self.distribution
+        return "%s[%s]" % (self.distribution, ",".join(self.extras))
+
+    @property
+    def pip_argument(self):
+        # Square brackets are glob characters in most shells: quote the
+        # requirement so that the command can be pasted as is in a terminal.
+        if not self.extras:
+            return self.distribution
+        return "'%s'" % self.requirement
+
+    def available(self):
+        """True when the module can be found on sys.path right now.
+
+        Deliberately PathFinder rather than importlib.util.find_spec(): for a
+        module that is already in sys.modules - which ours are as soon as a
+        model catalog has been read - find_spec() returns the cached spec
+        without ever touching the disk, so a package removed under our feet
+        would keep looking installed until the process restarts.  PathFinder
+        searches sys.path itself and therefore notices both directions.
+
+        This only handles top level names, which is all our dependencies are.
+        """
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(self.module,
+                                                            sys.path)
+        except (ImportError, ValueError, TypeError, AttributeError) as error:
+            LOG_MSG.debug("cannot look up module %s (%s)", self.module, error)
+            return False
+
+        return spec is not None
+
+    def __repr__(self):
+        return "<STTBackendDependency %s>" % self.requirement
+
+
+# NOTE: keep the keys in sync with the "backend" GSettings key and with the
+# check buttons of sttconfigdialog.ui.
+_BACKENDS = {
+    "vosk": {
+        "name": "Vosk",
+        "dependencies": (),
+        "components": {
+            "engine":  ("sttgstvosk", "STTGstVosk"),
+            "model":   ("sttvoskmodel", "STTVoskModel"),
+            "manager": ("sttvoskmodelmanagers", "stt_vosk_online_model_manager"),
+        },
+    },
+    "whisper": {
+        "name": "Whisper",
+        "dependencies": (),
+        "components": {
+            "engine":  ("sttgstwhisper", "STTGstWhisper"),
+            "model":   ("sttwhispermodel", "STTWhisperModel"),
+            "manager": ("sttwhispermodelmanagers", "stt_whisper_online_model_manager"),
+        },
+    },
+    "onnxasr": {
+        "name": "onnx-asr",
+        "dependencies": (
+            STTBackendDependency("onnx_asr", "onnx-asr", ("cpu", "hub")),
+        ),
+        "components": {
+            "engine":  ("sttgstonnxasr", "STTGstOnnxAsr"),
+            "model":   ("sttonnxasrmodel", "STTOnnxAsrModel"),
+            "manager": ("sttonnxasrmodelmanagers", "stt_onnxasr_online_model_manager"),
+        },
+    },
+    "moonshine": {
+        "name": "Moonshine",
+        "dependencies": (
+            STTBackendDependency("moonshine_voice", "moonshine-voice"),
+        ),
+        "components": {
+            "engine":  ("sttgstmoonshine", "STTGstMoonshine"),
+            "model":   ("sttmoonshinemodel", "STTMoonshineModel"),
+            "manager": ("sttmoonshinemodelmanagers", "stt_moonshine_online_model_manager"),
+        },
+    },
+}
+
+STT_DEFAULT_BACKEND = "vosk"
+
+# Cache the lookups: they are queried from callbacks that can run on every
+# model/locale change. Dropped by stt_invalidate_availability_cache().
+_availability_cache = {}
+
+
+def stt_backends():
+    return tuple(_BACKENDS.keys())
+
+
+def stt_backend_display_name(backend):
+    entry = _BACKENDS.get(backend)
+    if entry is None:
+        return backend
+    return entry["name"]
+
+
+def stt_backend_dependencies(backend):
+    entry = _BACKENDS.get(backend)
+    if entry is None:
+        return ()
+    return entry["dependencies"]
+
+
+def stt_invalidate_availability_cache():
+    """Forget previous results so that a module installed or removed in the
+    meantime can be picked up without restarting the process."""
+    _availability_cache.clear()
+    # Directory listings are cached by the path finders themselves: without
+    # this a package added or deleted since start-up may not be seen.
+    importlib.invalidate_caches()
+
+
+def stt_backend_missing_dependencies(backend, refresh=False):
+    """Return the list of dependencies of ``backend`` that are not installed."""
+    if refresh:
+        stt_invalidate_availability_cache()
+
+    missing = []
+    for dependency in stt_backend_dependencies(backend):
+        available = _availability_cache.get(dependency.module)
+        if available is None:
+            available = dependency.available()
+            _availability_cache[dependency.module] = available
+            LOG_MSG.debug("module %s available: %s",
+                          dependency.module, available)
+        if not available:
+            missing.append(dependency)
+
+    return missing
+
+
+def stt_backend_is_available(backend, refresh=False):
+    return not stt_backend_missing_dependencies(backend, refresh=refresh)
+
+
+def stt_backend_install_command(backend):
+    """The command to paste in a terminal to install what is missing."""
+    missing = stt_backend_missing_dependencies(backend)
+    if not missing:
+        return ""
+
+    return "pip install %s" % " ".join(
+        dependency.pip_argument for dependency in missing)
+
+
+def stt_backend_component(backend, component):
+    """Import and return a class/function implementing part of a backend.
+
+    ``component`` is one of "engine", "model" or "manager".  The import is
+    deliberately done lazily: a backend whose dependencies are installed while
+    the dialog is running then becomes usable without restarting it, and a
+    broken optional backend cannot prevent the dialog from being built.
+    Returns None when the component cannot be imported.
+    """
+    entry = _BACKENDS.get(backend)
+    if entry is None:
+        LOG_MSG.warning("unknown backend (%s)", backend)
+        return None
+
+    location = entry["components"].get(component)
+    if location is None:
+        return None
+
+    module_name, attribute = location
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as error:
+        LOG_MSG.warning("cannot import %s for backend %s (%s)",
+                        module_name, backend, error)
+        return None
+
+    value = getattr(module, attribute, None)
+    if value is None:
+        LOG_MSG.warning("%s has no attribute %s", module_name, attribute)
+    return value
+
+
+def stt_backend_model_manager(backend):
+    """Return the online model manager singleton of ``backend``, or None."""
+    manager = stt_backend_component(backend, "manager")
+    if manager is None:
+        return None
+
+    try:
+        return manager()
+    except Exception as error:
+        LOG_MSG.warning("cannot create model manager for %s (%s)",
+                        backend, error)
+        return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # vim:set et sts=4 sw=4:
 #
 # ibus-stt - Speech To Text engine for IBus
