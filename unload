@@ -1,4 +1,358 @@
 
+8
+--
+ engine/sttgstonnxasr.py | 116 +++++++++++++++++++++++++++++++---------
+ 1 file changed, 92 insertions(+), 24 deletions(-)
+ 
+diff --git a/engine/sttgstonnxasr.py b/engine/sttgstonnxasr.py
+index 8e68dec..e925be7 100644
+--- a/engine/sttgstonnxasr.py
++++ b/engine/sttgstonnxasr.py
+@@ -29,6 +29,9 @@ from sttonnxasrmodel import STTOnnxAsrModel
+ 
+ LOG_MSG = logging.getLogger()
+ 
++# Upper bound on how long stop() may wait for pending transcriptions.
++FINAL_DRAIN_TIMEOUT = 5.0
++
+ try:
+     import onnx_asr
+     ONNXASR_AVAILABLE = True
+@@ -80,6 +83,7 @@ class STTGstOnnxAsr(STTGstBase):
+         self._model_id = 0
+         self._model = None
+         self._recognizer = None
++        self._load_generation = 0
+         self._set_model()
+ 
+         self._audio_buffer = []
+@@ -92,6 +96,9 @@ class STTGstOnnxAsr(STTGstBase):
+         self._process_thread = None
+         self._stop_processing = False
+ 
++        self._draining = False
++        self._drain_done = threading.Event()
++
+         self._use_partial_results = False
+         self._audio_lock = threading.Lock()
+ 
+@@ -105,8 +112,20 @@ class STTGstOnnxAsr(STTGstBase):
+ 
+     def destroy(self):
+         self._stop_processing = True
++        self._load_generation += 1   # invalidate any in-flight model load
++
++        # Drop anything still queued so the worker exits quickly.
++        while True:
++            try:
++                self._process_queue.get_nowait()
++                self._process_queue.task_done()
++            except queue.Empty:
++                break
++
++        thread_alive = False
+         if self._process_thread is not None:
+             self._process_thread.join(timeout=2.0)
++            thread_alive = self._process_thread.is_alive()
+             self._process_thread = None
+ 
+         self._current_locale.disconnect(self._locale_id)
+@@ -117,33 +136,22 @@ class STTGstOnnxAsr(STTGstBase):
+             self._model_id = 0
+ 
+         self._appsink = None
++        # The worker keeps its own reference (recognizer local): only
++        # drop ours unconditionally, the session is freed when the last
++        # reference goes away.
++        if thread_alive == True:
++            LOG_MSG.warning("worker still transcribing, session freed later")
+         self._recognizer = None
+ 
+         LOG_MSG.info("OnnxAsr.destroy() called")
+         super().destroy()
+ 
+-    def _load_onnxasr_model(self, model_name):
+-        """Load onnx-asr model."""
+-        if not ONNXASR_AVAILABLE:
+-            LOG_MSG.error("onnx-asr not available")
+-            return False
+-
+-        try:
+-            LOG_MSG.info("Loading onnx-asr model: %s", model_name)
+-            self._recognizer = onnx_asr.load_model(model_name)
+-            LOG_MSG.info("onnx-asr model loaded successfully")
+-            return True
+-
+-        except Exception as e:
+-            LOG_MSG.error("Failed to load onnx-asr model: %s", e)
+-            self._recognizer = None
+-            return False
+-
+     def _set_model_path(self):
+         if self._model is None or self._model.available() is False:
+             LOG_MSG.info("model not available (%s - %s)",
+                         self._model.get_name() if self._model else "None",
+                         self._model.get_path() if self._model else "None")
++            self._load_generation += 1
+             self._recognizer = None
+             self.emit("model-changed")
+             return
+@@ -155,13 +163,50 @@ class STTGstOnnxAsr(STTGstBase):
+         if state >= Gst.State.READY:
+             self.pipeline.set_state(Gst.State.READY)
+ 
+-        success = self._load_onnxasr_model(model_name)
++        # Load asynchronously: onnxruntime session creation takes
++        # several seconds and this runs in the IBus main loop (engine
++        # creation, locale change, model change). Blocking here froze
++        # the whole engine process, hanging the panel and the setup
++        # dialog until the load completed.
++        self._load_generation += 1
++        self._recognizer = None
++        threading.Thread(target=self._load_model_thread,
++                         args=(model_name, state, self._load_generation),
++                         daemon=True).start()
+ 
+-        if state >= Gst.State.READY:
+-            self.pipeline.set_state(state)
++    def _load_model_thread(self, model_name, restore_state, generation):
++        recognizer = None
++        if not ONNXASR_AVAILABLE:
++            LOG_MSG.error("onnx-asr not available")
++        else:
++            try:
++                LOG_MSG.info("Loading onnx-asr model: %s", model_name)
++                recognizer = onnx_asr.load_model(model_name)
++                LOG_MSG.info("onnx-asr model loaded successfully")
++            except Exception as e:
++                LOG_MSG.error("Failed to load onnx-asr model: %s", e)
+ 
+-        if success:
+-            self.emit("model-changed")
++        GLib.idle_add(self._model_load_done_cb,
++                      recognizer, restore_state, generation)
++
++    def _model_load_done_cb(self, recognizer, restore_state, generation):
++        # The engine may have been destroyed, or the model/locale may
++        # have changed again while we were loading: drop stale results.
++        if self.pipeline is None or generation != self._load_generation:
++            LOG_MSG.debug("discarding stale model load")
++            return False
++
++        self._recognizer = recognizer
++
++        if recognizer is not None and restore_state > Gst.State.READY:
++            # Restore the previous pipeline state, unless something else
++            # changed it while we were loading.
++            ret, current, pending = self.pipeline.get_state(0)
++            if current == Gst.State.READY:
++                self.pipeline.set_state(restore_state)
++
++        self.emit("model-changed")
++        return False
+ 
+     def _model_changed(self, model):
+         self._set_model_path()
+@@ -184,6 +229,13 @@ class STTGstOnnxAsr(STTGstBase):
+ 
+     def _on_new_sample(self, appsink):
+         """Callback when new audio sample arrives."""
++        # While draining final results or tearing down, keep swallowing
++        # buffers but do not queue new work, otherwise the drain can
++        # never complete as long as the mic picks up sound.
++        if self._draining or self._stop_processing:
++            appsink.emit("pull-sample")
++            return Gst.FlowReturn.OK
++
+         sample = appsink.emit("pull-sample")
+         if sample is None:
+             return Gst.FlowReturn.OK
+@@ -248,6 +300,8 @@ class STTGstOnnxAsr(STTGstBase):
+             recognizer = self._recognizer
+             if recognizer is None:
+                 self._process_queue.task_done()
++                if self._process_queue.unfinished_tasks == 0:
++                    self._drain_done.set()
+                 continue
+ 
+             try:
+@@ -268,14 +322,28 @@ class STTGstOnnxAsr(STTGstBase):
+                 LOG_MSG.error("onnx-asr transcription error: %s", e, exc_info=True)
+ 
+             self._process_queue.task_done()
++            if self._process_queue.unfinished_tasks == 0:
++                self._drain_done.set()
+ 
+     def _emit_text(self, text):
+         self.emit("text", text)
+         return False
+ 
+     def get_final_results(self):
+-        self._process_audio_buffer(force=True)
+-        self._process_queue.join()
++        # Bounded, event-based drain. Queue.join() here could block the
++        # main loop indefinitely since the pipeline is still PLAYING at
++        # this point and kept feeding the queue being joined.
++        self._draining = True
++        try:
++            self._process_audio_buffer(force=True)
++
++            self._drain_done.clear()
++            if self._process_queue.unfinished_tasks == 0:
++                return
++            if self._drain_done.wait(FINAL_DRAIN_TIMEOUT) == False:
++                LOG_MSG.warning("timed out draining pending transcriptions")
++        finally:
++            self._draining = False
+ 
+     def get_results(self):
+         pass
+
+
+7
+engine/sttgstwhisper.py | 65 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 56 insertions(+), 9 deletions(-)
+ 
+diff --git a/engine/sttgstwhisper.py b/engine/sttgstwhisper.py
+index 7d7c98b..850013b 100644
+--- a/engine/sttgstwhisper.py
++++ b/engine/sttgstwhisper.py
+@@ -37,6 +37,8 @@ MAX_TOKENS          = 32
+ _cpu_count = os.cpu_count() or 1
+ N_THREADS           = max(4, _cpu_count // 2 )
+ MAX_RING_QUEUE_DEPTH = 2
++# Upper bound on how long stop() may wait for pending transcriptions.
++FINAL_DRAIN_TIMEOUT = 5.0
+ 
+ class STTGstWhisper(STTGstBase):
+     __gtype_name__ = 'STTGstWhisper'
+@@ -105,6 +107,8 @@ class STTGstWhisper(STTGstBase):
+         self._process_queue   = queue.Queue()
+         self._process_thread  = None
+         self._stop_processing = False
++        self._draining        = False
++        self._drain_done      = threading.Event()
+         self._use_partial_results = False
+ 
+     def __del__(self):
+@@ -116,8 +120,20 @@ class STTGstWhisper(STTGstBase):
+ 
+     def destroy(self):
+         self._stop_processing = True
++
++        # Drop anything still queued so the worker exits quickly.
++        while True:
++            try:
++                self._process_queue.get_nowait()
++                self._process_queue.task_done()
++            except queue.Empty:
++                break
++
++        thread_alive = False
+         if self._process_thread is not None:
+             self._process_thread.join(timeout=2.0)
++            thread_alive = self._process_thread.is_alive()
++            self._process_thread = None
+ 
+         self._current_locale.disconnect(self._locale_id)
+         self._locale_id = 0
+@@ -127,7 +143,14 @@ class STTGstWhisper(STTGstBase):
+             self._model_id = 0
+ 
+         self._appsink = None
+-        self._whisper = None
++        # Only drop the model reference if the worker really exited:
++        # freeing whisper.cpp state under a running transcribe() is
++        # undefined behavior. The thread is a daemon, the reference is
++        # reclaimed when it finishes or when the process exits.
++        if thread_alive == False:
++            self._whisper = None
++        else:
++            LOG_MSG.warning("worker still transcribing, keeping model alive")
+         self._vad     = None
+         LOG_MSG.info("Whisper.destroy() called")
+         super().destroy()
+@@ -220,6 +243,13 @@ class STTGstWhisper(STTGstBase):
+         self._set_model()
+ 
+     def _on_new_sample(self, appsink):
++        # While draining final results or tearing down, keep swallowing
++        # buffers but do not queue new work: otherwise the drain below
++        # can never complete as long as the mic picks up sound.
++        if self._draining or self._stop_processing:
++            sample = appsink.emit("pull-sample")
++            return Gst.FlowReturn.OK
++
+         sample = appsink.emit("pull-sample")
+         if sample is None:
+             return Gst.FlowReturn.OK
+@@ -310,6 +340,8 @@ class STTGstWhisper(STTGstBase):
+ 
+             if self._whisper is None:
+                 self._process_queue.task_done()
++                if self._process_queue.unfinished_tasks == 0:
++                    self._drain_done.set()
+                 continue
+ 
+             try:
+@@ -340,21 +372,36 @@ class STTGstWhisper(STTGstBase):
+                 LOG_MSG.error("Whisper transcription error: %s", e, exc_info=True)
+ 
+             self._process_queue.task_done()
++            if self._process_queue.unfinished_tasks == 0:
++                self._drain_done.set()
+ 
+     def _emit_text(self, text):
+         self.emit("text", text)
+         return False
+ 
+     def get_final_results(self):
+-        if self._vad is not None:
+-            remaining = self._vad.flush()
+-            if remaining is not None:
+-                self._enqueue_for_transcription(remaining, source='vad')
+-        else:
+-            self._flush_chunks_to_ring()
+-            self._dispatch_to_worker()
++        # Stop queueing new work while we drain, and never block the
++        # main loop indefinitely: Queue.join() here used to deadlock
++        # because the pipeline is still PLAYING at this point, so the
++        # appsink kept feeding the very queue being joined (mic stayed
++        # open and the process could only be killed by 'ibus restart').
++        self._draining = True
++        try:
++            if self._vad is not None:
++                remaining = self._vad.flush()
++                if remaining is not None:
++                    self._enqueue_for_transcription(remaining, source='vad')
++            else:
++                self._flush_chunks_to_ring()
++                self._dispatch_to_worker()
+ 
+-        self._process_queue.join()
++            self._drain_done.clear()
++            if self._process_queue.unfinished_tasks == 0:
++                return
++            if self._drain_done.wait(FINAL_DRAIN_TIMEOUT) == False:
++                LOG_MSG.warning("timed out draining pending transcriptions")
++        finally:
++            self._draining = False
+ 
+     def get_results(self):
+         pass
+
+
+
+
+
+
+
+
+
+
+
+
+
 1
 ---
  engine/sttgstfactory.py | 17 +++++++++++++++++
