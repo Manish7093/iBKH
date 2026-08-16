@@ -1,0 +1,376 @@
+
+1
+---
+ engine/sttgstfactory.py | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+ 
+diff --git a/engine/sttgstfactory.py b/engine/sttgstfactory.py
+index 8a6eb59..cb62b37 100644
+--- a/engine/sttgstfactory.py
++++ b/engine/sttgstfactory.py
+@@ -101,6 +101,23 @@ class STTGstFactory(GObject.GObject):
+     def __preload_changed(self, settings, key):
+         self.__update_preloaded_engine()
+ 
++    @property
++    def has_preload(self):
++        return self._preload is not None
++
++    def drop_preload(self):
++        # Called when the STT input source is removed from the session (or
++        # right before exiting): the "preload" setting may still be true but
++        # there is no point in keeping the model in memory any longer.
++        # If the setting is toggled off and on again later,
++        # __update_preloaded_engine() will preload a new engine.
++        if self._preload is None:
++            return
++
++        LOG_MSG.info("dropping preloaded engine")
++        self._preload.release()
++        self._preload=None
++
+ _GLOBAL_FACTORY = None
+ 
+ def stt_gst_factory_default() :
+-- 
+
+
+2
+---
+ engine/main.py             | 86 +++++++++++++++++++++++++++++++++++++-
+ engine/sttenginefactory.py | 20 ++++++++-
+ 2 files changed, 103 insertions(+), 3 deletions(-)
+ 
+diff --git a/engine/main.py b/engine/main.py
+index c79166c..dff9b27 100644
+--- a/engine/main.py
++++ b/engine/main.py
+@@ -42,6 +42,12 @@ from sttgstfactory import stt_gst_factory_default
+ 
+ LOG_MSG=logging.getLogger()
+ 
++# Grace period before exiting once no engine instance is left. IBus
++# destroys/recreates engine instances when the user merely switches
++# between input sources, so exiting immediately would mean reloading
++# everything (possibly a big model) on every switch.
++IDLE_EXIT_TIMEOUT=60
++
+ class IMApplication(Adw.Application):
+     __gtype_name__ = 'IMApplication'
+ 
+@@ -56,6 +62,9 @@ class IMApplication(Adw.Application):
+         self.__factory=None
+         self.__component=None
+ 
++        self.__idle_timer=0
++        self.__input_sources_settings=None
++
+     def do_handle_local_options(self, options):
+         LOG_MSG.info("Local options parsing")
+ 
+@@ -128,9 +137,21 @@ class IMApplication(Adw.Application):
+         self.__bus = IBus.Bus()
+         self.__bus.connect("disconnected", self.__bus_disconnected_cb)
+ 
+-        self.__factory = STTEngineFactory(self.__bus)
++        self.__factory = STTEngineFactory(self.__bus,
++                                          activity_cb=self.__engine_activity_cb)
+         self.__factory.add_engine("stt", GObject.type_from_name("STTEngine"))
+ 
++        # On GNOME, watch the input sources so we can free the preloaded
++        # model (and exit) as soon as the STT source is removed (#22).
++        # On other desktops the schema is missing and we fall back to the
++        # plain idle-exit behavior.
++        schema_source=Gio.SettingsSchemaSource.get_default()
++        if schema_source is not None and \
++           schema_source.lookup("org.gnome.desktop.input-sources", True) is not None:
++            self.__input_sources_settings=Gio.Settings.new("org.gnome.desktop.input-sources")
++            self.__input_sources_settings.connect("changed::sources",
++                                                  self.__input_sources_changed_cb)
++
+         if self.__exec_by_ibus:
+             self.__bus.request_name("org.freedesktop.IBus.STT", 0)
+         else:
+@@ -138,6 +159,12 @@ class IMApplication(Adw.Application):
+             self.__component = IBus.Component.new_from_file(xml_path)
+             self.__bus.register_component (self.__component)
+ 
++        # ibus-daemon sometimes spawns the component without requesting
++        # an engine right away (e.g. the source was merely added, not
++        # selected). Prime the idle-exit logic so we do not linger
++        # forever in that case; engine creation cancels the timer.
++        self.__engine_activity_cb(self.__factory.engine_count)
++
+         # Start a loop
+         self.hold()
+ 
+@@ -145,6 +172,63 @@ class IMApplication(Adw.Application):
+         LOG_MSG.info("bus disconnect")
+         self.release()
+ 
++    def __stt_in_input_sources(self):
++        # Returns True/False, or None when we cannot know (non-GNOME).
++        if self.__input_sources_settings is None:
++            return None
++
++        sources=self.__input_sources_settings.get_value("sources").unpack()
++        return ("ibus", "stt") in sources
++
++    def __engine_activity_cb(self, engine_count):
++        if engine_count > 0:
++            if self.__idle_timer != 0:
++                LOG_MSG.debug("engine created, cancelling idle-exit timer")
++                GLib.source_remove(self.__idle_timer)
++                self.__idle_timer=0
++            return
++
++        if self.__idle_timer == 0:
++            LOG_MSG.info("no engine left alive, idle-exit in %is", IDLE_EXIT_TIMEOUT)
++            self.__idle_timer=GLib.timeout_add_seconds(IDLE_EXIT_TIMEOUT,
++                                                       self.__idle_exit_cb)
++
++    def __input_sources_changed_cb(self, settings, key):
++        if self.__stt_in_input_sources() is not False:
++            return
++
++        LOG_MSG.info("STT removed from input sources, unloading model")
++        stt_gst_factory_default().drop_preload()
++
++        # If an engine instance is still alive, its imminent destruction
++        # will trigger __engine_activity_cb() which schedules the exit.
++        if self.__factory is not None and \
++           self.__factory.engine_count == 0 and \
++           self.__idle_timer == 0:
++            self.__idle_timer=GLib.timeout_add_seconds(5, self.__idle_exit_cb)
++
++    def __idle_exit_cb(self):
++        self.__idle_timer=0
++
++        gst_factory=stt_gst_factory_default()
++        in_sources=self.__stt_in_input_sources()
++
++        if in_sources is False:
++            # Not an input source anymore: nothing to keep warm.
++            LOG_MSG.info("STT not among input sources, exiting")
++            gst_factory.drop_preload()
++            self.release()
++        elif gst_factory.has_preload == False:
++            # Still an input source (or unknown) but nothing preloaded:
++            # exit anyway, ibus-daemon respawns us on demand and startup
++            # is cheap without a model to load.
++            LOG_MSG.info("idle with no preloaded engine, exiting")
++            self.release()
++        else:
++            LOG_MSG.info("staying alive to keep the preloaded engine warm")
++
++        return GLib.SOURCE_REMOVE
++
+ if __name__ == "__main__":
+     LOG_MSG=logging.getLogger()
+     msg_handler=logging.StreamHandler()
+diff --git a/engine/sttenginefactory.py b/engine/sttenginefactory.py
+index 496789f..8ee3874 100644
+--- a/engine/sttenginefactory.py
++++ b/engine/sttenginefactory.py
+@@ -30,13 +30,19 @@ LOG_MSG=logging.getLogger()
+ class STTEngineFactory(IBus.Factory):
+     __gtype_name__ = 'STTEngineFactory'
+ 
+-    def __init__(self, bus):
++    def __init__(self, bus, activity_cb=None):
+         self._bus=bus
+         self._current_engine=None
++        self._engine_count=0
++        self._activity_cb=activity_cb
+         super().__init__(object_path=IBus.PATH_FACTORY,
+                          connection=bus.get_connection())
+         # Stop there, we create this object to control engine creation
+ 
++    @property
++    def engine_count(self):
++        return self._engine_count
++
+     def do_create_engine(self, engine_name):
+         LOG_MSG.debug("New engine requested %s", engine_name)
+         if engine_name != "stt":
+@@ -44,9 +50,19 @@ class STTEngineFactory(IBus.Factory):
+ 
+         engine=STTEngine(self._bus, "/org/freedesktop/IBus/STT")
+         self._current_engine=engine
+-        LOG_MSG.debug("Creating new engine")
++        self._engine_count += 1
++        engine.connect("destroy", self.__engine_destroyed_cb)
++        LOG_MSG.debug("Creating new engine (%i alive)", self._engine_count)
++        if self._activity_cb is not None:
++            self._activity_cb(self._engine_count)
+         return engine
+ 
++    def __engine_destroyed_cb(self, engine):
++        self._engine_count=max(0, self._engine_count - 1)
++        LOG_MSG.debug("Engine destroyed (%i alive)", self._engine_count)
++        if self._activity_cb is not None:
++            self._activity_cb(self._engine_count)
++
+     def do_destroy(self):
+         self._current_engine=None
+         super().do_destroy(self)
+\ No newline at end of file
+
+3
+--
+ engine/sttgstfactory.py | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+ 
+diff --git a/engine/sttgstfactory.py b/engine/sttgstfactory.py
+index cb62b37..57b9a91 100644
+--- a/engine/sttgstfactory.py
++++ b/engine/sttgstfactory.py
+@@ -24,10 +24,12 @@ from gi.repository import Gio
+ 
+ from sttutils import *
+ 
+-from sttgstvosk import STTGstVosk
+-from sttgstwhisper import STTGstWhisper
+-from sttgstonnxasr import STTGstOnnxAsr
+-from sttgstmoonshine import STTGstMoonshine
++# Note: backend modules (sttgstvosk, sttgstwhisper, sttgstonnxasr,
++# sttgstmoonshine) are imported lazily in new_engine(). Importing them
++# here would pull the python libraries of every installed backend
++# (onnxruntime, pywhispercpp, moonshine_voice, numpy...) into every
++# engine process, inflating its baseline memory footprint by tens of
++# MB even when the engine is never used.
+ 
+ from sttbackenddeps import (stt_backend_display_name,
+                             stt_backend_install_command,
+@@ -66,15 +68,19 @@ class STTGstFactory(GObject.GObject):
+                 backend = "vosk"
+             if backend == "whisper":
+                 LOG_MSG.info("Using Whisper backend")
++                from sttgstwhisper import STTGstWhisper
+                 engine=STTGstWhisper()
+             elif backend == "onnxasr":
+                 LOG_MSG.info("Using onnx-asr backend")
++                from sttgstonnxasr import STTGstOnnxAsr
+                 engine=STTGstOnnxAsr()
+             elif backend == "moonshine":
+                 LOG_MSG.info("Using Moonshine backend")
++                from sttgstmoonshine import STTGstMoonshine
+                 engine=STTGstMoonshine()
+             else:
+                 LOG_MSG.info("Using Vosk backend")
++                from sttgstvosk import STTGstVosk
+                 engine=STTGstVosk()
+             self._current_engine=weakref.ref(engine)
+         else:
+-- 
+
+4
+
+Related: #22
+---
+ engine/main.py      | 10 +++++-----
+ engine/sttengine.py | 10 ++++++++--
+ 2 files changed, 13 insertions(+), 7 deletions(-)
+ 
+diff --git a/engine/main.py b/engine/main.py
+index dff9b27..c7d6834 100644
+--- a/engine/main.py
++++ b/engine/main.py
+@@ -27,11 +27,9 @@ import gi
+ 
+ gi.require_version('Gst', '1.0')
+ gi.require_version('IBus', '1.0')
+-gi.require_version('Adw', '1')
+ 
+ from gi.repository import IBus
+ from gi.repository import GLib
+-from gi.repository import Adw
+ from gi.repository import Gio
+ from gi.repository import GObject
+ from gi.repository import Gst
+@@ -48,7 +46,10 @@ LOG_MSG=logging.getLogger()
+ # everything (possibly a big model) on every switch.
+ IDLE_EXIT_TIMEOUT=60
+ 
+-class IMApplication(Adw.Application):
++# Note: a plain Gio.Application is enough here. Using Adw.Application
++# mapped the whole GTK4/libadwaita stack into a headless input-method
++# process; the configuration dialog runs in its own process anyway.
++class IMApplication(Gio.Application):
+     __gtype_name__ = 'IMApplication'
+ 
+     def __init__(self, **kwargs):
+@@ -93,7 +94,7 @@ class IMApplication(Adw.Application):
+         LOG_MSG.info("startup")
+ 
+         # Is it the right way to chain up?
+-        Adw.Application.do_startup(self)
++        Gio.Application.do_startup(self)
+ 
+     def do_command_line(self, args):
+         already_running=args.get_is_remote()
+@@ -247,7 +248,6 @@ if __name__ == "__main__":
+     locale.textdomain('ibus-stt')
+ 
+     Gst.init(sys.argv)
+-    Adw.init()
+ 
+     app = IMApplication(application_id=stt_utils_get_app_id(),
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE|
+diff --git a/engine/sttengine.py b/engine/sttengine.py
+index b9ef1fc..1dcde48 100644
+--- a/engine/sttengine.py
++++ b/engine/sttengine.py
+@@ -26,10 +26,12 @@ import gi
+ 
+ gi.require_version('IBus', '1.0')
+ gi.require_version('Pango', '1.0')
+-gi.require_version('Gtk', '4.0')
++
++# Note: Gtk/Adw are imported lazily in the 'about' property handler.
++# They are only needed for the About dialog and would otherwise map
++# the whole GTK4/libadwaita stack into every engine process.
+ 
+ from gi.repository import IBus
+-from gi.repository import Gtk, Adw
+ from gi.repository import Gio
+ 
+ from sttutils import *
+@@ -364,6 +366,10 @@ class STTEngine(IBus.Engine):
+         elif prop_name == 'configuration':
+             subprocess.Popen([os.path.join(stt_utils_get_libexec(), "ibus-setup-stt")])
+         elif prop_name == 'about':
++            gi.require_version('Gtk', '4.0')
++            gi.require_version('Adw', '1')
++            from gi.repository import Gtk, Adw
++            Adw.init()
+             dialog = Adw.AboutWindow(application_name=_("IBus Speech To Text"),
+                             title=_("About IBus Speech To Text"),
+                             application_icon="user-available-symbolic",
+-- 
+
+5
+engine/sttgstbase.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+ 
+diff --git a/engine/sttgstbase.py b/engine/sttgstbase.py
+index cc07db7..af2b349 100644
+--- a/engine/sttgstbase.py
++++ b/engine/sttgstbase.py
+@@ -77,6 +77,16 @@ class STTGstBase (GObject.Object):
+         self._pipeline.set_state(Gst.State.NULL)
+         self._pipeline=None
+ 
++        # glibc's allocator rarely returns freed heap pages to the kernel
++        # on its own, so unloading a model would not show up in the
++        # process RSS (e.g. in GNOME System Monitor) even though the
++        # memory was actually freed. Give it a nudge.
++        try:
++            import ctypes
++            ctypes.CDLL("libc.so.6").malloc_trim(0)
++        except (OSError, AttributeError):
++            pass
++
+         LOG_MSG.info("GstBase.destroy() called")
+ 
+     def hold(self):
