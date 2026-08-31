@@ -1,3 +1,2266 @@
+Sttgstonnxasr 
+
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import gc
+import logging
+import threading
+import queue
+import numpy as np
+
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttonnxasrmodel import STTOnnxAsrModel
+from sttonnxasrmodelmanagers import ONNXASR_QUANTIZATION
+
+LOG_MSG = logging.getLogger()
+
+# Upper bound on how long stop() may wait for pending transcriptions.
+FINAL_DRAIN_TIMEOUT = 5.0
+
+# NOTE: onnx_asr (and onnxruntime underneath it) is deliberately NOT imported
+# at module level. "import onnxruntime" dlopen()s a large native library and
+# holds the GIL while doing so, and this module is imported from the IBus main
+# loop (STTGstFactory.new_engine()) and from the setup dialog
+# (stt_backend_component()). A top level import therefore freezes both
+# processes before any of the asynchronous loading below even starts. Same
+# lazy import pattern as sttgstmoonshine.
+
+
+def _session_options():
+    """onnxruntime SessionOptions tuned for a desktop input method."""
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+
+    # onnxruntime defaults to one intra-op thread per physical core and lets
+    # the pool spin while waiting for work. For a background input method that
+    # pins the whole machine during a chunk and keeps burning cycles between
+    # utterances, which is what starves gnome-shell and the setup dialog into
+    # "not responding".
+    opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+
+    # The BFC arena never hands memory back to the allocator, which defeats
+    # the malloc_trim(0) in STTGstBase.destroy(). With 6 s chunks the reuse it
+    # buys is not worth several hundred MB of retained RSS.
+    opts.enable_cpu_mem_arena = False
+
+    return opts
+
+
+def _load_recognizer(model_name):
+    """Build the recognizer. Only ever called from a loader thread."""
+    import onnx_asr
+
+    opts = _session_options()
+
+    if ONNXASR_QUANTIZATION:
+        try:
+            return onnx_asr.load_model(model_name,
+                                       quantization=ONNXASR_QUANTIZATION,
+                                       sess_options=opts)
+        except Exception as error:
+            LOG_MSG.info("no %s weights for %s (%s), falling back to fp32",
+                         ONNXASR_QUANTIZATION, model_name, error)
+
+    return onnx_asr.load_model(model_name, sess_options=opts)
+
+
+class STTGstOnnxAsr(STTGstBase):
+    __gtype_name__ = 'STTGstOnnxAsr'
+    _pipeline_def = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                    "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                    "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
+                    "queue ! " \
+                    "appsink name=OnnxAsrSink emit-signals=true sync=false"
+
+    _pipeline_def_alt = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                        "queue ! " \
+                        "appsink name=OnnxAsrSink emit-signals=true sync=false"
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstOnnxAsr._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstOnnxAsr._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("OnnxAsrSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model = None
+        self._recognizer = None
+        self._load_generation = 0
+
+        self._audio_buffer = []
+        self._buffer_duration = 0.0
+        self._max_buffer_duration = 6.0
+        self._min_buffer_duration = 2.0
+        self._sample_rate = 16000
+        self._processing = False
+        self._process_queue = queue.Queue()
+        self._process_thread = None
+        self._stop_processing = False
+
+        self._draining = False
+        self._drain_done = threading.Event()
+
+        self._use_partial_results = False
+        self._audio_lock = threading.Lock()
+
+        # Kept last: _set_model() starts the asynchronous model load, whose
+        # completion callback touches the state initialised above.
+        self._set_model()
+
+    def __del__(self):
+        LOG_MSG.info("OnnxAsr __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+            self._process_thread = None
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        self._load_generation += 1   # invalidate any in-flight model load
+
+        # Drop anything still queued so the worker exits quickly.
+        while True:
+            try:
+                self._process_queue.get_nowait()
+                self._process_queue.task_done()
+            except queue.Empty:
+                break
+
+        thread_alive = False
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+            thread_alive = self._process_thread.is_alive()
+            self._process_thread = None
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        # The managers hold references to the model's bound methods, so
+        # without an explicit teardown the model is never collected, __del__
+        # never runs and its custom path registration is never released.
+        if self._model is not None:
+            self._model.destroy()
+            self._model = None
+
+        self._appsink = None
+        # The worker keeps its own reference (recognizer local): only drop
+        # ours unconditionally, the session is freed when the last reference
+        # goes away.
+        if thread_alive:
+            LOG_MSG.warning("worker still transcribing, session freed later")
+        self._recognizer = None
+
+        LOG_MSG.info("OnnxAsr.destroy() called")
+
+        # engine <-> model <-> signal closure cycles keep the onnxruntime
+        # arena referenced; collect before STTGstBase.destroy() calls
+        # malloc_trim(0), otherwise nothing is returned to the allocator.
+        gc.collect()
+
+        super().destroy()
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info("model not available (%s - %s)",
+                        self._model.get_name() if self._model else "None",
+                        self._model.get_path() if self._model else "None")
+            self._load_generation += 1
+            self._recognizer = None
+            self.emit("model-changed")
+            return
+
+        model_name = self._model.get_path()
+        LOG_MSG.debug("model ready %s", model_name)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        # Load asynchronously: onnxruntime session creation takes several
+        # seconds and this runs in the IBus main loop (engine creation, locale
+        # change, model change). Blocking here froze the whole engine process,
+        # hanging the panel and the setup dialog until the load completed.
+        self._load_generation += 1
+        self._recognizer = None
+        threading.Thread(target=self._load_model_thread,
+                         args=(model_name, state, self._load_generation),
+                         daemon=True).start()
+
+    def _load_model_thread(self, model_name, restore_state, generation):
+        recognizer = None
+        try:
+            LOG_MSG.info("Loading onnx-asr model: %s", model_name)
+            recognizer = _load_recognizer(model_name)
+            LOG_MSG.info("onnx-asr model loaded successfully")
+        except Exception as e:
+            LOG_MSG.error("Failed to load onnx-asr model: %s", e)
+
+        GLib.idle_add(self._model_load_done_cb,
+                      recognizer, restore_state, generation)
+
+    def _model_load_done_cb(self, recognizer, restore_state, generation):
+        # The engine may have been destroyed, or the model/locale may have
+        # changed again while we were loading: drop stale results.
+        if self.pipeline is None or generation != self._load_generation:
+            LOG_MSG.debug("discarding stale model load")
+            return False
+
+        self._recognizer = recognizer
+
+        if recognizer is not None and restore_state > Gst.State.READY:
+            # Restore the previous pipeline state, unless something else
+            # changed it while we were loading.
+            ret, current, pending = self.pipeline.get_state(0)
+            if current == Gst.State.READY:
+                self.pipeline.set_state(restore_state)
+
+        self.emit("model-changed")
+        return False
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if self._model is not None and \
+           self._model.get_locale() == self._current_locale.locale:
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        if self._model is not None:
+            self._model.destroy()
+
+        self._model = STTOnnxAsrModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    def _on_new_sample(self, appsink):
+        """Callback when new audio sample arrives."""
+        # While draining final results or tearing down, keep swallowing
+        # buffers but do not queue new work, otherwise the drain can never
+        # complete as long as the mic picks up sound.
+        if self._draining or self._stop_processing:
+            appsink.emit("pull-sample")
+            return Gst.FlowReturn.OK
+
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_data = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        with self._audio_lock:
+            self._audio_buffer.append(audio_data)
+            self._buffer_duration += len(audio_data) / self._sample_rate
+            trigger_process = self._buffer_duration >= self._max_buffer_duration
+
+        if trigger_process:
+            self._process_audio_buffer()
+
+        return Gst.FlowReturn.OK
+
+    def _process_audio_buffer(self, force=False):
+        """Process accumulated audio buffer."""
+        with self._audio_lock:
+            if len(self._audio_buffer) == 0:
+                return
+
+            if not force and self._buffer_duration < self._min_buffer_duration:
+                LOG_MSG.debug("Buffer too short (%.2fs), waiting for more audio", self._buffer_duration)
+                return
+
+            if self._recognizer is None:
+                LOG_MSG.warning("onnx-asr model not loaded")
+                self._audio_buffer.clear()
+                self._buffer_duration = 0.0
+                return
+
+            audio = np.concatenate(self._audio_buffer)
+            self._audio_buffer.clear()
+            self._buffer_duration = 0.0
+
+            LOG_MSG.debug("Processing audio buffer: %d samples (%.2f seconds)",
+                         len(audio), len(audio) / self._sample_rate)
+
+            audio_float = audio.astype(np.float32) / 32768.0
+
+            self._process_queue.put(audio_float)
+
+            if self._process_thread is None or not self._process_thread.is_alive():
+                self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
+                self._process_thread.start()
+
+    def _process_worker(self):
+        """Background worker to process audio."""
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            recognizer = self._recognizer
+            if recognizer is None:
+                self._process_queue.task_done()
+                if self._process_queue.unfinished_tasks == 0:
+                    self._drain_done.set()
+                continue
+
+            try:
+                LOG_MSG.debug("Starting transcription of %d samples", len(audio))
+
+                text = recognizer.recognize(audio, sample_rate=self._sample_rate)
+
+                if isinstance(text, str):
+                    text = text.strip()
+
+                if text:
+                    LOG_MSG.info("onnx-asr transcription result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed from audio")
+
+            except Exception as e:
+                LOG_MSG.error("onnx-asr transcription error: %s", e, exc_info=True)
+
+            self._process_queue.task_done()
+            if self._process_queue.unfinished_tasks == 0:
+                self._drain_done.set()
+
+            # Do not hold the session across the next blocking get(): this
+            # local reference would otherwise keep it alive past destroy().
+            recognizer = None
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False
+
+    def get_final_results(self):
+        # Bounded, event-based drain. Queue.join() here could block the main
+        # loop indefinitely since the pipeline is still PLAYING at this point
+        # and kept feeding the queue being joined.
+        self._draining = True
+        try:
+            self._process_audio_buffer(force=True)
+
+            self._drain_done.clear()
+            if self._process_queue.unfinished_tasks == 0:
+                return
+            if self._drain_done.wait(FINAL_DRAIN_TIMEOUT) is False:
+                LOG_MSG.warning("timed out draining pending transcriptions")
+        finally:
+            self._draining = False
+
+    def get_results(self):
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+Sttonnxasrmodelmanagers 
+
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import logging
+import threading
+from pathlib import Path
+from enum import Enum
+
+from gi.repository import GObject, Gio, GLib
+
+LOG_MSG = logging.getLogger()
+
+# HuggingFace cache directory
+HF_CACHE_DIR = Path(os.getenv('HF_HOME', str(Path.home() / '.cache' / 'huggingface'))) / 'hub'
+
+# Weight precision requested from onnx-asr. The fp32 parakeet 0.6b encoder
+# alone is 2.4 GB, against roughly 650 MB for int8: on an 8 GB machine that is
+# the difference between fitting in RAM and swapping. Accuracy cost is modest
+# for the short chunks this engine feeds it (_max_buffer_duration is 6 s; the
+# known int8 regression only shows up on audio well past 20-30 s).
+# Set to None to keep fp32 everywhere.
+ONNXASR_QUANTIZATION = "int8"
+
+# onnx-asr model catalog: name -> (locale, size, repo_id)
+# Sizes are approximate *int8* download sizes, matching ONNXASR_QUANTIZATION
+# above. The fp32 variants are roughly 4x larger; the previous numbers here
+# were fp32-era guesses and understated parakeet by about 8x.
+ONNXASR_MODELS = {
+    "nemo-parakeet-tdt-0.6b-v3": ("multilingual", "~670 MB", "istupakov/parakeet-tdt-0.6b-v3-onnx"),
+    "nemo-parakeet-tdt-0.6b-v2": ("en", "~670 MB", "istupakov/parakeet-tdt-0.6b-v2-onnx"),
+    "nemo-parakeet-ctc-0.6b": ("en", "~630 MB", "istupakov/parakeet-ctc-0.6b-onnx"),
+    "nemo-parakeet-rnnt-0.6b": ("en", "~640 MB", "istupakov/parakeet-rnnt-0.6b-onnx"),
+    "nemo-canary-1b-v2": ("multilingual", "~1 GB", "istupakov/canary-1b-v2-onnx"),
+    "nemo-fastconformer-ru-ctc": ("ru", "~130 MB", "istupakov/nemo-fastconformer-ru-onnx"),
+    "nemo-fastconformer-ru-rnnt": ("ru", "~130 MB", "istupakov/nemo-fastconformer-ru-onnx"),
+    "gigaam-v2-ctc": ("ru", "~250 MB", "istupakov/gigaam-v2-onnx"),
+    "gigaam-v2-rnnt": ("ru", "~250 MB", "istupakov/gigaam-v2-onnx"),
+    "gigaam-v3-ctc": ("ru", "~250 MB", "istupakov/gigaam-v3-onnx"),
+    "gigaam-v3-rnnt": ("ru", "~250 MB", "istupakov/gigaam-v3-onnx"),
+    "gigaam-v3-e2e-ctc": ("ru", "~250 MB", "istupakov/gigaam-v3-onnx"),
+    "gigaam-v3-e2e-rnnt": ("ru", "~250 MB", "istupakov/gigaam-v3-onnx"),
+    "whisper-base": ("multilingual", "~80 MB", "istupakov/whisper-base-onnx"),
+}
+
+
+def _repo_cache_path(repo_id):
+    """Get the HuggingFace cache path for a repo ID."""
+    return HF_CACHE_DIR / ("models--" + repo_id.replace("/", "--"))
+
+
+def _fetch_model_files(model_name):
+    """Download a model's files without building any onnxruntime session.
+
+    onnx_asr.load_model() also creates the InferenceSessions, which would put
+    a second multi-hundred-MB copy of the model inside the setup process while
+    ibus-engine-stt already holds one. The resolver only resolves and fetches
+    the files it needs.
+    """
+    try:
+        from onnx_asr.loader import create_asr_resolver
+    except ImportError:
+        # Older onnx-asr without the resolver helper: fall back to the
+        # session-building path rather than failing the download outright.
+        import onnx_asr
+        LOG_MSG.warning("onnx_asr.loader.create_asr_resolver is missing, "
+                        "downloading through load_model()")
+        onnx_asr.load_model(model_name)
+        return
+
+    resolver = create_asr_resolver(model_name)
+
+    if ONNXASR_QUANTIZATION:
+        try:
+            resolver.resolve_model(quantization=ONNXASR_QUANTIZATION)
+            return
+        except Exception as error:
+            LOG_MSG.info("no %s weights for %s (%s), downloading fp32",
+                         ONNXASR_QUANTIZATION, model_name, error)
+
+    resolver.resolve_model()
+
+
+def _is_repo_cached(repo_id):
+    """Check if a HuggingFace repo is cached locally."""
+    snapshots = _repo_cache_path(repo_id) / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    try:
+        return any(snapshots.iterdir())
+    except OSError:
+        return False
+
+
+class STTDownloadState(float, Enum):
+    STOPPED = -1.0
+    UNKNOWN_PROGRESS = -0.5
+    UNPACKING = -0.6
+    ONGOING = 0.0
+
+
+class STTOnnxAsrModelDescription(GObject.Object):
+    __gtype_name__ = "STTOnnxAsrModelDescription"
+
+    def __init__(self, init_model=None):
+        super().__init__()
+        self.name = init_model.name if init_model is not None else ""
+        self.custom = init_model.custom if init_model is not None else False
+        self.is_obsolete = False
+        self.paths = init_model.paths if init_model is not None else []
+        self.size = init_model.size if init_model is not None else ""
+        self.type = init_model.type if init_model is not None else ""
+        self.locale = init_model.locale if init_model is not None else ""
+        self.url = init_model.url if init_model is not None else ""
+        self.repo_id = init_model.repo_id if init_model is not None else ""
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+
+    def _download_finished(self):
+        if self._operation is not None and self._operation.is_cancelled():
+            self._operation = None
+
+    def _download_model_thread(self, model_name, status):
+        try:
+            self.download_progress = STTDownloadState.UNKNOWN_PROGRESS
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                GLib.idle_add(self._download_finished)
+                return
+
+            # Fetch the files only: building the sessions here would load a
+            # full copy of the model into the setup process.
+            _fetch_model_files(model_name)
+
+            if status.is_cancelled():
+                self.download_progress = STTDownloadState.STOPPED
+                GLib.idle_add(self._download_finished)
+                return
+
+            # Update paths after successful download
+            if self.repo_id:
+                cache_path = _repo_cache_path(self.repo_id)
+                if cache_path.is_dir():
+                    self.paths = [str(cache_path)]
+
+        except Exception as e:
+            LOG_MSG.error("Download error for %s: %s", model_name, e)
+
+        self.download_progress = STTDownloadState.STOPPED
+        GLib.idle_add(self._download_finished)
+
+    def stop_downloading(self):
+        if self._operation is not None:
+            self._operation.cancel()
+
+    def start_downloading(self):
+        if self._operation is not None:
+            return
+
+        LOG_MSG.debug("start downloading onnx-asr model (%s)", self.name)
+
+        self.download_progress = STTDownloadState.ONGOING
+        self._operation = Gio.Cancellable()
+
+        # daemon: a non-daemon thread keeps the setup process alive until a
+        # multi-hundred-MB download finishes, long after the window is closed.
+        download_thread = threading.Thread(
+            target=self._download_model_thread,
+            args=(self.name, self._operation),
+            daemon=True
+        )
+        download_thread.start()
+
+    def get_best_path_for_model(self):
+        if self.paths in [None, []]:
+            return None
+        return self.paths[0]
+
+    def delete_paths(self):
+        if self.custom is True:
+            return
+
+        if not self.repo_id:
+            return
+
+        import shutil
+        cache_path = _repo_cache_path(self.repo_id)
+        if cache_path.is_dir():
+            try:
+                shutil.rmtree(cache_path)
+            except Exception as e:
+                LOG_MSG.error("Failed to delete %s: %s", cache_path, e)
+
+        self._operation = None
+        self.download_progress = STTDownloadState.STOPPED
+        self.paths = []
+
+
+class STTOnnxAsrLocalModelManager(GObject.Object):
+    __gtype_name__ = "STTOnnxAsrLocalModelManager"
+
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (str, str,)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (str, str,)),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._monitors = []
+        self._models_dict = {}
+        self._locales_dict = {}
+        self._custom_models = {}
+        self._scan_cached_models()
+        self._setup_monitor()
+
+    def _add_model_description_to_locale(self, model_desc):
+        if model_desc.locale is None:
+            return
+
+        models_list = self._locales_dict.get(model_desc.locale, None)
+        if models_list is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            models_list.append(model_desc)
+
+    def _scan_cached_models(self):
+        """Scan HuggingFace cache for known onnx-asr models."""
+        # Scan HuggingFace cache for downloaded models
+        for model_name, (locale, size, repo_id) in ONNXASR_MODELS.items():
+            if model_name in self._models_dict:
+                continue
+
+            if _is_repo_cached(repo_id):
+                cache_path = str(_repo_cache_path(repo_id))
+                model_desc = STTOnnxAsrModelDescription()
+                model_desc.name = model_name
+                model_desc.locale = locale
+                model_desc.size = size
+                model_desc.repo_id = repo_id
+                model_desc.paths = [cache_path]
+                model_desc.type = model_name.split("-")[0] if "-" in model_name else model_name
+
+                self._models_dict[model_name] = model_desc
+                self._add_model_description_to_locale(model_desc)
+                LOG_MSG.debug("found cached onnx-asr model: %s at %s", model_name, cache_path)
+
+    def _setup_monitor(self):
+        """Monitor the HuggingFace cache directory for changes."""
+        try:
+            HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            LOG_MSG.warning("Cannot create HuggingFace cache directory: %s", HF_CACHE_DIR)
+            return
+
+        monitor = Gio.File.new_for_path(str(HF_CACHE_DIR)).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        monitor.connect("changed", self._cache_dir_changed_cb)
+        self._monitors.append(monitor)
+
+    def _cache_dir_changed_cb(self, monitor, file, other_file, event_type):
+        if event_type not in (Gio.FileMonitorEvent.CREATED,
+                              Gio.FileMonitorEvent.DELETED,
+                              Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+            return
+
+        dir_name = file.get_basename()
+
+        for model_name, (locale, size, repo_id) in ONNXASR_MODELS.items():
+            expected_dir = "models--" + repo_id.replace("/", "--")
+            if dir_name != expected_dir:
+                continue
+
+            if event_type in (Gio.FileMonitorEvent.CREATED,
+                              Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+                if model_name not in self._models_dict and _is_repo_cached(repo_id):
+                    cache_path = str(_repo_cache_path(repo_id))
+                    model_desc = STTOnnxAsrModelDescription()
+                    model_desc.name = model_name
+                    model_desc.locale = locale
+                    model_desc.size = size
+                    model_desc.repo_id = repo_id
+                    model_desc.paths = [cache_path]
+                    model_desc.type = model_name.split("-")[0] if "-" in model_name else model_name
+
+                    self._models_dict[model_name] = model_desc
+                    self._add_model_description_to_locale(model_desc)
+                    self.emit("added", model_name, cache_path)
+                    LOG_MSG.info("onnx-asr model now available: %s", model_name)
+
+            elif event_type == Gio.FileMonitorEvent.DELETED:
+                model_desc = self._models_dict.pop(model_name, None)
+                if model_desc is not None:
+                    models_list = self._locales_dict.get(model_desc.locale, [])
+                    if model_desc in models_list:
+                        models_list.remove(model_desc)
+                    if not any(models_list):
+                        self._locales_dict.pop(model_desc.locale, None)
+
+                    self.emit("removed", model_name, str(_repo_cache_path(repo_id)))
+                    LOG_MSG.info("onnx-asr model removed: %s", model_name)
+
+    def path_available(self, model_name):
+        return model_name in self._models_dict
+
+    def get_models_for_locale(self, locale_str):
+        models = self._locales_dict.get(locale_str, []).copy()
+        multilingual = self._locales_dict.get("multilingual", [])
+        models.extend(multilingual)
+        return models
+
+    def get_best_path_for_model(self, model_name):
+        if model_name is None:
+            return None
+
+        model = self._models_dict.get(model_name, None)
+        if model is None:
+            return None
+
+        # For onnx-asr, the "path" is the model name identifier
+        return model_name
+
+    def get_model_description(self, model_name):
+        return self._models_dict.get(model_name, None)
+
+    def get_supported_locales(self):
+        return list(self._locales_dict.keys())
+
+    def register_custom_model_path(self, model_name, locale_str):
+        """Register a custom HuggingFace model repo ID."""
+        if model_name in ONNXASR_MODELS:
+            LOG_MSG.debug("registered a catalog model name (%s)", model_name)
+            return
+
+        if model_name in self._custom_models:
+            self._custom_models[model_name] += 1
+            LOG_MSG.debug("custom model already registered (%s). Increasing refcount (%i).",
+                         model_name, self._custom_models[model_name])
+            return
+
+        self._custom_models[model_name] = 1
+
+        # For custom models, repo_id is the model name itself (a HF repo path)
+        repo_id = model_name
+        model_desc = STTOnnxAsrModelDescription()
+        model_desc.name = model_name
+        model_desc.custom = True
+        model_desc.locale = locale_str
+        model_desc.repo_id = repo_id
+
+        if _is_repo_cached(repo_id):
+            model_desc.paths = [str(_repo_cache_path(repo_id))]
+
+        self._models_dict[model_name] = model_desc
+        self._add_model_description_to_locale(model_desc)
+        self.emit("added", None, model_name)
+
+    def unregister_custom_model_path(self, model_name):
+        if model_name not in self._custom_models:
+            LOG_MSG.debug("trying to unregister unknown custom model (%s)", model_name)
+            return
+
+        if self._custom_models[model_name] != 1:
+            LOG_MSG.debug("refcount of custom model not 0 yet (%s)", model_name)
+            self._custom_models[model_name] -= 1
+            return
+
+        self._custom_models.pop(model_name, None)
+
+        model_desc = self._models_dict.pop(model_name, None)
+        if model_desc is not None:
+            models_list = self._locales_dict.get(model_desc.locale, [])
+            if model_desc in models_list:
+                models_list.remove(model_desc)
+            if not any(models_list):
+                self._locales_dict.pop(model_desc.locale, None)
+
+            self.emit("removed", None, model_name)
+
+
+_GLOBAL_LOCAL_MANAGER = None
+
+def stt_onnxasr_local_model_manager():
+    global _GLOBAL_LOCAL_MANAGER
+    if _GLOBAL_LOCAL_MANAGER is None:
+        _GLOBAL_LOCAL_MANAGER = STTOnnxAsrLocalModelManager()
+    return _GLOBAL_LOCAL_MANAGER
+
+
+class STTOnnxAsrOnlineModelManager(GObject.Object):
+    __gtype_name__ = "STTOnnxAsrOnlineModelManager"
+    __gsignals__ = {
+        "added": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "changed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        "removed": (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+    }
+
+    def __init__(self):
+        super().__init__()
+
+        self._locales_dict = {}
+        self._online_models = {}
+
+        local_manager = stt_onnxasr_local_model_manager()
+        local_manager.connect("added", self._model_added_cb)
+        local_manager.connect("removed", self._model_removed_cb)
+        self._populate_with_onnxasr_models()
+
+    def _populate_with_onnxasr_models(self):
+        for model_name, (locale, size, repo_id) in ONNXASR_MODELS.items():
+            model_desc = STTOnnxAsrModelDescription()
+            model_desc.name = model_name
+            model_desc.locale = locale
+            model_desc.size = size
+            model_desc.repo_id = repo_id
+            model_desc.type = model_name.split("-")[0] if "-" in model_name else model_name
+            # STTModelRow only shows the download/delete button when url is non-empty,
+            # so expose the HuggingFace repo page as the URL marker.
+            model_desc.url = "https://huggingface.co/" + repo_id
+
+            LOG_MSG.debug("adding online onnx-asr model (%s)", model_name)
+
+            local_desc = stt_onnxasr_local_model_manager().get_model_description(model_name)
+            if local_desc is not None:
+                model_desc.paths = local_desc.paths
+
+            self._online_models[model_name] = model_desc
+            self._add_model_description_to_locale(model_desc)
+
+        # Add locally-available custom models not in catalog
+        for locale in stt_onnxasr_local_model_manager().get_supported_locales():
+            model_list = stt_onnxasr_local_model_manager().get_models_for_locale(locale)
+            for model_desc in model_list:
+                key = model_desc.name
+                if key in self._online_models:
+                    continue
+
+                LOG_MSG.debug("adding local custom model to online dict (%s)", key)
+                self._online_models[key] = model_desc
+                self._add_model_description_to_locale(model_desc)
+
+    def _add_model_description_to_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+
+        if locale_models is None:
+            self._locales_dict[model_desc.locale] = [model_desc]
+        else:
+            locale_models.append(model_desc)
+
+    def _model_added_cb(self, manager, model_name, model_path):
+        if model_name is not None:
+            online_model_desc = self._online_models.get(model_name, None)
+            local_model_desc = manager.get_model_description(model_name)
+        else:
+            online_model_desc = self._online_models.get(model_path, None)
+            local_model_desc = manager.get_model_description(model_path)
+
+        if online_model_desc is not None:
+            if online_model_desc.paths in [None, []]:
+                online_model_desc.paths = local_model_desc.paths if local_model_desc else []
+
+            self.emit("changed", online_model_desc)
+            return
+
+        if local_model_desc is not None:
+            key = local_model_desc.name
+            self._online_models[key] = local_model_desc
+            self._add_model_description_to_locale(local_model_desc)
+            self.emit("added", local_model_desc)
+
+    def _remove_model_description_from_locale(self, model_desc):
+        locale_models = self._locales_dict.get(model_desc.locale, None)
+        if locale_models and model_desc in locale_models:
+            locale_models.remove(model_desc)
+        if locale_models is not None and not any(locale_models):
+            self._locales_dict.pop(model_desc.locale, None)
+
+    def _model_removed_cb(self, manager, model_name, model_path):
+        if model_name is None:
+            online_model_desc = self._online_models.pop(model_path, None)
+            if online_model_desc:
+                self._remove_model_description_from_locale(online_model_desc)
+                self.emit("removed", online_model_desc)
+            return
+
+        online_model_desc = self._online_models.get(model_name, None)
+        if online_model_desc is None:
+            return
+
+        online_model_desc.paths = []
+
+        # Catalog models stay listed even when not downloaded
+        if model_name in ONNXASR_MODELS:
+            self.emit("changed", online_model_desc)
+            return
+
+        self._online_models.pop(model_name, None)
+        self._remove_model_description_from_locale(online_model_desc)
+        self.emit("removed", online_model_desc)
+
+    def get_model_description(self, model_name):
+        return self._online_models.get(model_name, None)
+
+    def get_models_for_locale(self, locale_str):
+        models = self._locales_dict.get(locale_str, []).copy()
+        if locale_str != 'multilingual':
+            multilingual = self._locales_dict.get('multilingual', [])
+            models.extend(multilingual)
+        return models
+
+    def supported_locales(self):
+        return list(self._locales_dict.keys())
+
+
+_GLOBAL_ONLINE_MANAGER = None
+
+def stt_onnxasr_online_model_manager():
+    global _GLOBAL_ONLINE_MANAGER
+    if _GLOBAL_ONLINE_MANAGER is None:
+        _GLOBAL_ONLINE_MANAGER = STTOnnxAsrOnlineModelManager()
+    return _GLOBAL_ONLINE_MANAGER
+
+
+
+Sttonnxasrmodel 
+
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import json
+import logging
+
+from gi.repository import GObject, Gio
+from sttonnxasrmodelmanagers import stt_onnxasr_local_model_manager
+
+LOG_MSG = logging.getLogger()
+
+class STTOnnxAsrModel(GObject.Object):
+    __gtype_name__ = "STTOnnxAsrModel"
+    __gsignals__ = {
+        "changed": (GObject.SIGNAL_RUN_FIRST, None, ()),
+    }
+
+    def __init__(self, locale_str=None):
+        super().__init__()
+
+        self._locale_str = locale_str
+        self._settings_id = 0
+        self._model_added_id = 0
+        self._model_removed_id = 0
+
+        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._settings_id = self._settings.connect("changed::onnxasr-models", self._models_changed)
+
+        self._model_name = None
+        self._model_path = None
+        self._valid_model = False
+
+        model = self._get_model_from_settings()
+        self._set_model(model)
+
+        self._model_added_id = stt_onnxasr_local_model_manager().connect("added", self._model_added_cb)
+        self._model_removed_id = stt_onnxasr_local_model_manager().connect("removed", self._model_removed_cb)
+
+    def destroy(self):
+        # The local manager holds references to these bound methods, so this
+        # object stays reachable and __del__ never runs: every locale/model
+        # change would otherwise leak one STTOnnxAsrModel plus its custom path
+        # registration. Callers must invoke destroy() explicitly.
+        if self._model_added_id != 0:
+            stt_onnxasr_local_model_manager().disconnect(self._model_added_id)
+            self._model_added_id = 0
+
+        if self._model_removed_id != 0:
+            stt_onnxasr_local_model_manager().disconnect(self._model_removed_id)
+            self._model_removed_id = 0
+
+        if self._settings_id != 0:
+            self._settings.disconnect(self._settings_id)
+            self._settings_id = 0
+
+        if self._model_name is None and self._model_path is not None:
+            stt_onnxasr_local_model_manager().unregister_custom_model_path(self._model_path)
+            self._model_path = None
+
+    def __del__(self):
+        # Safety net for callers that forget destroy(); usually a no-op.
+        self.destroy()
+
+    def _get_model_from_settings(self):
+        models_json_string = self._settings.get_string("onnxasr-models")
+        if models_json_string in (None, "None", ""):
+            return None
+
+        models_dict = json.loads(models_json_string)
+        return models_dict.get(self._locale_str, None)
+
+    def _set_model(self, model):
+        LOG_MSG.debug("new onnx-asr model (%s, current path=%s / current name=%s)",
+                     model, self._model_path, self._model_name)
+        if model is None:
+            if self._model_name is None and self._model_path is None:
+                return
+
+            self._model_name = None
+            self._model_path = None
+            self._valid_model = False
+
+            self.emit("changed")
+            return
+
+        model = model.strip()
+        model_name = self._model_name
+        model_path = self._model_path
+
+        # For onnx-asr, custom models are HuggingFace repo IDs containing "/"
+        if "/" in model:
+            if self._model_name is None and self._model_path == model:
+                return
+
+            self._model_name = None
+            self._model_path = model
+            stt_onnxasr_local_model_manager().register_custom_model_path(model, self._locale_str)
+            self._valid_model = stt_onnxasr_local_model_manager().path_available(model)
+        else:
+            tmp_model_path = stt_onnxasr_local_model_manager().get_best_path_for_model(model)
+            if self._model_name == model and tmp_model_path == model_path:
+                return
+
+            self._model_name = model
+            self._model_path = tmp_model_path
+            self._valid_model = bool(tmp_model_path is not None)
+
+        if model_path not in [self._model_path, None] and model_name is None:
+            stt_onnxasr_local_model_manager().unregister_custom_model_path(model_path)
+
+        LOG_MSG.debug("onnx-asr model changed (valid=%i, current path=%s - current name=%s)",
+                     self._valid_model, self._model_path, self._model_name)
+        self.emit("changed")
+
+    def _models_changed(self, settings, key):
+        model = self._get_model_from_settings()
+        self._set_model(model)
+
+    def _model_added_cb(self, manager, name, path):
+        if self._model_name is not None:
+            if name != self._model_name:
+                return
+
+            model_path = stt_onnxasr_local_model_manager().get_best_path_for_model(name)
+            if self._model_path == model_path:
+                return
+
+            self._model_path = model_path
+        elif self._model_path != path:
+            return
+
+        self._valid_model = True
+        self.emit("changed")
+
+    def _model_removed_cb(self, manager, name, path):
+        if self._model_name is not None:
+            if name != self._model_name:
+                return
+
+            if self._model_path != path:
+                return
+
+            self._model_path = stt_onnxasr_local_model_manager().get_best_path_for_model(name)
+            self._valid_model = bool(self._model_path is not None)
+        elif self._model_path == path:
+            self._valid_model = False
+        else:
+            return
+
+        self.emit("changed")
+
+    def available(self):
+        return self._valid_model
+
+    def get_locale(self):
+        return self._locale_str
+
+    def get_name(self):
+        return self._model_name
+
+    def get_path(self):
+        return self._model_path
+
+    def set_name(self, model_name):
+        self._set_model(model_name)
+
+        models_json_string = self._settings.get_string("onnxasr-models")
+        if models_json_string in (None, "None", ""):
+            models_dict = {}
+        else:
+            models_dict = json.loads(models_json_string)
+
+        models_dict[self._locale_str] = model_name
+        models_json_string = json.dumps(models_dict)
+
+        if self._settings_id != 0:
+            self._settings.disconnect(self._settings_id)
+            self._settings_id = 0
+
+        self._settings.set_string("onnxasr-models", models_json_string)
+        self._settings_id = self._settings.connect("changed::onnxasr-models", self._models_changed)
+
+
+Sttconfigdialog 
+
+
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import logging
+import locale
+
+from gettext import gettext as _
+from babel import Locale, UnknownLocaleError
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+from gi.repository import Gtk, Gio, Gdk, GObject, Adw
+
+from sttutils import *
+from sttshortcutrow import STTShortcutRow
+from sttshortcutdialog import STTShortcutDialog
+
+from sttcurrentlocale import stt_current_locale
+from sttmodelchooserdialog import STTModelChooserDialog
+
+from sttbackenddeps import (STT_DEFAULT_BACKEND,
+                            stt_backend_component,
+                            stt_backend_display_name,
+                            stt_backend_install_command,
+                            stt_backend_is_available,
+                            stt_backend_missing_dependencies,
+                            stt_backend_model_manager,
+                            stt_invalidate_availability_cache)
+
+LOG_MSG=logging.getLogger()
+
+
+@Gtk.Template(resource_path="/org/freedesktop/ibus/engine/stt/config/sttconfigdialog.ui")
+class STTConfigDialog (Adw.Window):
+    __gtype_name__="STTConfigDialog"
+
+    main_stack    = Gtk.Template.Child()
+    toast_overlay = Gtk.Template.Child()
+
+    vosk_check    = Gtk.Template.Child()
+    whisper_check = Gtk.Template.Child()
+    onnxasr_check = Gtk.Template.Child()
+    moonshine_check = Gtk.Template.Child()
+
+    vosk_action_row      = Gtk.Template.Child()
+    whisper_action_row   = Gtk.Template.Child()
+    onnxasr_action_row   = Gtk.Template.Child()
+    moonshine_action_row = Gtk.Template.Child()
+
+    tab_stack    = Gtk.Template.Child()
+    tab_switcher = Gtk.Template.Child()
+
+    language_dropdown     = Gtk.Template.Child()
+    system_language_switch = Gtk.Template.Child()
+
+    model_info_row      = Gtk.Template.Child()
+    change_model_button = Gtk.Template.Child()
+
+    preload_model_switch   = Gtk.Template.Child()
+    active_on_start_switch = Gtk.Template.Child()
+
+    vc_whisper_warning   = Gtk.Template.Child()
+    voice_commands_group = Gtk.Template.Child()
+
+    commands_row    = Gtk.Template.Child()
+    case_row        = Gtk.Template.Child()
+    diacritics_row  = Gtk.Template.Child()
+    punctuation_row = Gtk.Template.Child()
+    custom_row      = Gtk.Template.Child()
+
+    category_stack     = Gtk.Template.Child()
+    commandslistbox    = Gtk.Template.Child()
+    caselistbox        = Gtk.Template.Child()
+    diacriticslistbox  = Gtk.Template.Child()
+    punctuationlistbox = Gtk.Template.Child()
+    customlistbox      = Gtk.Template.Child()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._valid_formatting_file_path = False
+        self._valid_formatting_file = False
+        self._valid_override_file = False
+        self._values_dict = {}
+        self._utterances_dict = {}
+        self._no_model_toast = None
+        self._unsupported_locale_toast = None
+        self._missing_deps_toast = None
+        self._model = None
+        self._suppress_language_cb = False
+        self._suppress_engine_cb = False
+        self._engine = None
+
+        self._settings=Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._settings.bind("preload", self.preload_model_switch, "active", Gio.SettingsBindFlags.DEFAULT)
+        self._settings.bind("active-on-start", self.active_on_start_switch, "active", Gio.SettingsBindFlags.DEFAULT)
+
+        self._backend_subtitles = {
+            backend: (row.get_subtitle() or "")
+            for backend, row in self._backend_action_rows().items()
+        }
+
+        # Load current locale
+        self._current_locale = stt_current_locale()
+        self._locale_sig_id=self._current_locale.connect("changed", self._locale_changed_cb)
+        self._override_file_changed_id=self._current_locale.connect("override-file-changed", self._override_file_changed_cb)
+        self._override_file_written=False
+
+        self._select_backend_button(self._backend())
+
+        self._locale_list = []
+        self._locale_names = Gtk.StringList()
+        self._refresh_locale_dropdown()
+
+        if self._current_locale.default_locale:
+            self._suppress_language_cb = True
+            self.system_language_switch.set_active(True)
+            self._suppress_language_cb = False
+            self.language_dropdown.set_sensitive(False)
+
+        self._init_model()
+
+        # This updates _valid_formatting_file and _valid_override_file
+        self._load_utterances()
+
+        # No engine is created here on purpose: see _ensure_engine(). Building
+        # one loaded a second copy of the ASR model into the setup process on
+        # top of the one ibus-engine-stt already holds.
+
+        self._update_voice_commands_visibility()
+
+        self._toast_action=Gio.SimpleAction.new("manage_model", None)
+        self._install_action=Gio.SimpleAction.new("install_backend", None)
+        action_group=Gio.SimpleActionGroup.new()
+        action_group.insert(self._toast_action)
+        action_group.insert(self._install_action)
+        self.insert_action_group("toast", action_group)
+        self._toast_action.connect("activate",
+                                   self._manage_model_action_activated)
+        self._install_action.connect("activate",
+                                     self._install_action_activated)
+
+        self._update_backend_rows()
+        self._refresh_status_messages()
+        self._backend_was_available = stt_backend_is_available(self._backend())
+        self.connect("notify::is-active", self._window_active_cb)
+
+    def _window_active_cb(self, *_args):
+        if not self.get_property("is-active"):
+            return
+
+        stt_invalidate_availability_cache()
+        available = stt_backend_is_available(self._backend())
+        if available == self._backend_was_available:
+            self._update_backend_rows()
+            return
+
+        self._backend_was_available = available
+        self._reload_backend()
+
+    def _backend(self):
+        backend = self._settings.get_string("backend")
+        if backend in ("", None):
+            return STT_DEFAULT_BACKEND
+        return backend
+
+    def _backend_check_buttons(self):
+        return {
+            "vosk":      self.vosk_check,
+            "whisper":   self.whisper_check,
+            "onnxasr":   self.onnxasr_check,
+            "moonshine": self.moonshine_check,
+        }
+
+    def _backend_action_rows(self):
+        return {
+            "vosk":      self.vosk_action_row,
+            "whisper":   self.whisper_action_row,
+            "onnxasr":   self.onnxasr_action_row,
+            "moonshine": self.moonshine_action_row,
+        }
+
+    def _backend_for_check_button(self, button):
+        for backend, check in self._backend_check_buttons().items():
+            if check == button:
+                return backend
+        return None
+
+    def _select_backend_button(self, backend):
+        button = self._backend_check_buttons().get(backend)
+        if button is None:
+            button = self.vosk_check
+
+        self._suppress_engine_cb = True
+        button.set_active(True)
+        self._suppress_engine_cb = False
+
+    def _update_backend_rows(self):
+        for backend, row in self._backend_action_rows().items():
+            subtitle = self._backend_subtitles.get(backend, "")
+            if stt_backend_is_available(backend):
+                row.set_subtitle(subtitle)
+            elif subtitle:
+                row.set_subtitle(_("%s · Not installed") % subtitle)
+            else:
+                row.set_subtitle(_("Not installed"))
+
+
+    def _destroy_engine(self):
+        # Tear down the existing engine if present.
+        if self._engine is None:
+            return
+
+        try:
+            self._engine.disconnect_by_func(self._engine_model_changed_cb)
+        except TypeError:
+            pass
+        self._engine.destroy()
+        self._engine = None
+
+    def _ensure_engine(self):
+        # Instantiate the recognition engine matching the current backend, on
+        # demand only.
+        #
+        # Constructing a backend engine loads the ASR model into *this*
+        # process on top of the copy ibus-engine-stt already has - for
+        # onnx-asr that is a second multi-hundred-MB onnxruntime session - and
+        # preload() also opens the microphone. Only the shortcut dialog
+        # actually needs a live engine, so everything else works off
+        # self._model instead.
+        if self._engine is not None:
+            return self._engine
+
+        backend = self._backend()
+        if not stt_backend_is_available(backend):
+            LOG_MSG.warning("backend %s is missing its dependencies, "
+                            "no engine created", backend)
+            return None
+
+        engine_class = stt_backend_component(backend, "engine")
+        if engine_class is None:
+            return None
+
+        try:
+            self._engine = engine_class(current_locale=self._current_locale)
+        except Exception as error:
+            LOG_MSG.error("cannot create engine for backend %s (%s)",
+                          backend, error)
+            self._engine = None
+            return None
+
+        self._engine.connect("model-changed", self._engine_model_changed_cb)
+        self._engine.preload()
+        LOG_MSG.debug("engine created (backend=%s), has_model=%s",
+                      backend, self._engine.has_model())
+        return self._engine
+
+    def _populate_locale_list(self):
+        self._locale_list.clear()
+        self._locale_names = Gtk.StringList()
+        system_locale_str = locale.getlocale()[0]
+        self._append_locale_option(system_locale_str)
+        if (self._current_locale.locale != system_locale_str
+                and self._current_locale.locale not in self._locale_list):
+            self._append_locale_option(self._current_locale.locale)
+
+        backend = self._backend()
+        if backend == "moonshine":
+            manager = stt_backend_model_manager("moonshine")
+        else:
+            manager = stt_backend_model_manager("vosk")
+
+        supported = manager.supported_locales() if manager is not None else []
+
+        _EXCLUDED = {"multilingual"}
+
+        for loc in sorted(supported):
+            if loc in _EXCLUDED:
+                continue
+            if loc not in self._locale_list:
+                self._append_locale_option(loc)
+
+    def _refresh_locale_dropdown(self):
+        # Rebuild the language list and hand it to the dropdown.
+        self._populate_locale_list()
+
+        self._suppress_language_cb = True
+        self.language_dropdown.set_model(self._locale_names)
+        self._suppress_language_cb = False
+
+        self._select_current_locale_in_dropdown()
+
+    def _append_locale_option(self, locale_str):
+        if locale_str in (None, "", "None", "multilingual"):
+            return
+        if locale_str in self._locale_list:
+            return
+
+        system_locale_str = locale.getlocale()[0]
+        try:
+            babel_locale = Locale.parse(locale_str)
+            name = babel_locale.get_display_name(system_locale_str)
+        except (UnknownLocaleError, ValueError):
+            name = locale_str
+
+        if locale_str == system_locale_str:
+            name = _("%s (system)") % name
+
+        self._locale_list.append(locale_str)
+        self._locale_names.append(name)
+
+    def _select_current_locale_in_dropdown(self):
+        try:
+            idx = self._locale_list.index(self._current_locale.locale)
+        except ValueError:
+            idx = 0
+
+        self._suppress_language_cb = True
+        self.language_dropdown.set_selected(idx)
+        self._suppress_language_cb = False
+
+    def _init_model(self):
+        if self._model != None:
+            try:
+                self._model.disconnect_by_func(self._model_changed_cb)
+            except TypeError:
+                pass
+            self._model = None
+
+        backend = self._backend()
+        locale_str = self._current_locale.locale
+
+        if stt_backend_is_available(backend):
+            model_class = stt_backend_component(backend, "model")
+            if model_class is not None:
+                try:
+                    self._model = model_class(locale_str=locale_str)
+                except Exception as error:
+                    LOG_MSG.error("cannot create model for backend %s (%s)",
+                                  backend, error)
+
+        if self._model is not None:
+            self._model.connect("changed", self._model_changed_cb)
+
+        self._update_model_info()
+
+    def _update_model_info(self):
+        backend = self._backend()
+
+        if stt_backend_missing_dependencies(backend):
+            self.model_info_row.set_title(
+                _("%s is not installed") % stt_backend_display_name(backend))
+            self.model_info_row.set_subtitle(
+                stt_backend_install_command(backend))
+            self.change_model_button.set_label(_("Install…"))
+            return
+
+        if self._model is None or not self._model.available():
+            self.model_info_row.set_title(_("No model downloaded"))
+            self.model_info_row.set_subtitle(
+                _("Download a model to get started"))
+            self.change_model_button.set_label(_("Download"))
+            return
+
+        self.change_model_button.set_label(_("Change"))
+        model_name = self._model.get_name()
+
+        if model_name in (None, ""):
+            model_path = self._model.get_path()
+            self.model_info_row.set_title(_("Custom model"))
+            self.model_info_row.set_subtitle(
+                model_path if (model_path and model_path != "")
+                else _("Installed manually"))
+            return
+
+        manager = stt_backend_model_manager(backend)
+        desc = manager.get_model_description(model_name) if manager else None
+
+        self.model_info_row.set_title(model_name)
+
+        if backend == "moonshine":
+            if desc is None:
+                self.model_info_row.set_subtitle(_("Unknown model"))
+            else:
+                mtype = (desc.type or "").replace("_", " ").title()
+                size  = desc.size or _("unknown size")
+                quality = desc.quality or ""
+                if quality:
+                    self.model_info_row.set_subtitle(
+                        _("%s · %s · %s") % (mtype, quality, size))
+                else:
+                    self.model_info_row.set_subtitle(
+                        _("%s · %s") % (mtype, size))
+
+        elif backend in ("whisper", "onnxasr"):
+            if desc is None:
+                self.model_info_row.set_subtitle(_("Unknown model"))
+            else:
+                mtype = (desc.type or "").capitalize()
+                size  = desc.size or _("unknown size")
+                if desc.locale == "en":
+                    self.model_info_row.set_subtitle(
+                        _("%s · English only · %s") % (mtype, size))
+                elif desc.locale == "multilingual":
+                    self.model_info_row.set_subtitle(
+                        _("%s · Multilingual · %s") % (mtype, size))
+                else:
+                    self.model_info_row.set_subtitle(
+                        _("%s · %s") % (mtype, size))
+        else:
+            if desc is None:
+                self.model_info_row.set_subtitle(_("Unknown size"))
+            else:
+                size = desc.size or _("unknown size")
+                if desc.is_obsolete:
+                    self.model_info_row.set_subtitle(_("Obsolete · %s") % size)
+                elif desc.type is not None and desc.type.startswith("big"):
+                    self.model_info_row.set_subtitle(
+                        _("Large model · %s") % size)
+                elif desc.type is not None:
+                    self.model_info_row.set_subtitle(
+                        _("Lightweight · %s") % size)
+                else:
+                    self.model_info_row.set_subtitle(size)
+
+    def _auto_prompt_model_download(self):
+        if not stt_backend_is_available(self._backend()):
+            return
+
+        if self._model is not None and not self._model.available():
+            dialog = STTModelChooserDialog(model=self._model)
+            dialog.set_transient_for(self)
+            dialog.present()
+
+    def _model_changed_cb(self, model):
+        self._update_model_info()
+
+    def _copy_to_clipboard(self, text):
+        clipboard = self.get_clipboard()
+        if clipboard is None:
+            return
+
+        try:
+            clipboard.set_content(
+                Gdk.ContentProvider.new_for_value(GObject.Value(str, text)))
+        except Exception as error:
+            LOG_MSG.warning("cannot copy to clipboard (%s)", error)
+
+    def _install_dialog_body(self, backend, missing):
+        modules = "\n".join("    • %s" % dep.requirement for dep in missing)
+        return _("The %(backend)s backend needs python modules that are not "
+                 "installed on this system:\n\n"
+                 "%(modules)s\n\n"
+                 "Install them in a terminal with the following command, "
+                 "then press “Check Again”:\n\n"
+                 "    %(command)s") % {
+                     "backend": stt_backend_display_name(backend),
+                     "modules": modules,
+                     "command": stt_backend_install_command(backend)}
+
+    def _present_install_dialog(self, backend):
+        missing = stt_backend_missing_dependencies(backend, refresh=True)
+        if not missing:
+            return False
+
+        heading = _("%s Is Not Installed") % stt_backend_display_name(backend)
+        body = self._install_dialog_body(backend, missing)
+        command = stt_backend_install_command(backend)
+
+        # Adw.AlertDialog needs libadwaita 1.5, fall back on Adw.MessageDialog.
+        if hasattr(Adw, "AlertDialog"):
+            dialog = Adw.AlertDialog(heading=heading, body=body)
+            self._setup_install_dialog(dialog, backend, command)
+            dialog.present(self)
+        else:
+            dialog = Adw.MessageDialog(transient_for=self, modal=True,
+                                       heading=heading, body=body)
+            self._setup_install_dialog(dialog, backend, command)
+            dialog.present()
+
+        return True
+
+    def _setup_install_dialog(self, dialog, backend, command):
+        dialog.add_response("close", _("Close"))
+        dialog.add_response("copy", _("Copy Command"))
+        dialog.add_response("recheck", _("Check Again"))
+        dialog.set_response_appearance("recheck",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("recheck")
+        dialog.set_close_response("close")
+        dialog.connect("response", self._install_dialog_response_cb,
+                       backend, command)
+
+    def _install_dialog_response_cb(self, dialog, response, backend, command):
+        if response == "copy":
+            self._copy_to_clipboard(command)
+            self.toast_overlay.add_toast(
+                Adw.Toast(title=_("Command copied to the clipboard"),
+                          timeout=3))
+            return
+
+        if response != "recheck":
+            return
+
+        if not stt_backend_is_available(backend, refresh=True):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title=_("%s is still not installed")
+                          % stt_backend_display_name(backend), timeout=5))
+            return
+
+        self._update_backend_rows()
+        if backend != self._backend():
+            self._apply_backend(backend)
+        else:
+            self._reload_backend()
+
+    def _install_action_activated(self, _action, _param):
+        self._present_install_dialog(self._backend())
+
+    def _backend_not_installed(self):
+        if self._missing_deps_toast != None:
+            return
+
+        if self._no_model_toast != None:
+            self._no_model_toast.dismiss()
+            self._no_model_toast = None
+        if self._unsupported_locale_toast != None:
+            self._unsupported_locale_toast.dismiss()
+            self._unsupported_locale_toast = None
+
+        self._missing_deps_toast = Adw.Toast(
+            title=_("%s is not installed")
+                  % stt_backend_display_name(self._backend()),
+            timeout=0,
+            button_label=_("How to Install"),
+            action_name="toast.install_backend")
+        self._missing_deps_toast.connect("dismissed", self._toast_dismissed)
+        self.toast_overlay.add_toast(self._missing_deps_toast)
+
+    def _refresh_status_messages(self):
+        if not stt_backend_is_available(self._backend()):
+            self._backend_not_installed()
+            return
+
+        if self._missing_deps_toast != None:
+            self._missing_deps_toast.dismiss()
+            self._missing_deps_toast = None
+
+        # Model availability only: querying the engine here would force it to
+        # be built, and with it a second copy of the model.
+        if self._model is None or not self._model.available():
+            self._engine_has_no_model()
+            return
+
+        if self._no_model_toast != None:
+            self._no_model_toast.dismiss()
+            self._no_model_toast = None
+
+        if self._valid_formatting_file == False:
+            self._unsupported_locale()
+        elif self._unsupported_locale_toast != None:
+            self._unsupported_locale_toast.dismiss()
+            self._unsupported_locale_toast = None
+
+    def _update_voice_commands_visibility(self):
+        is_vosk = (self._backend() == "vosk")
+        self.vc_whisper_warning.set_visible(not is_vosk)
+        self.voice_commands_group.set_visible(is_vosk)
+
+        if (not is_vosk
+                and self.tab_stack.get_visible_child_name() == "voice_commands"):
+            self.tab_stack.set_visible_child_name("setup")
+
+    @Gtk.Template.Callback()
+    def engine_toggled_cb(self, button):
+        if not button.get_active():
+            return
+        if getattr(self, '_suppress_engine_cb', False):
+            return
+
+        backend = self._backend_for_check_button(button)
+        if backend is None:
+            return
+
+        current = self._backend()
+        if backend == current:
+            return
+
+        if not stt_backend_is_available(backend, refresh=True):
+            self._select_backend_button(current)
+            self._update_backend_rows()
+            self._present_install_dialog(backend)
+            return
+
+        self._apply_backend(backend)
+
+    def _apply_backend(self, backend):
+        self._settings.set_string("backend", backend)
+        self._select_backend_button(backend)
+        self._reload_backend(prompt_download=True)
+
+    def _reload_backend(self, prompt_download=False):
+        self._refresh_locale_dropdown()
+        self._init_model()
+        # Drop the old backend's engine; a new one is built on demand.
+        self._destroy_engine()
+        self._update_voice_commands_visibility()
+        self._empty_shortcut_page()
+        self._load_utterances()
+        self._update_backend_rows()
+        self._refresh_status_messages()
+
+        if (prompt_download
+                and self._model is not None
+                and not self._model.available()):
+            self._auto_prompt_model_download()
+
+    @Gtk.Template.Callback()
+    def language_selected_cb(self, dropdown, _param):
+        if self._suppress_language_cb:
+            return
+
+        idx = dropdown.get_selected()
+        if idx == Gtk.INVALID_LIST_POSITION or idx >= len(self._locale_list):
+            return
+
+        locale_str = self._locale_list[idx]
+        if locale_str == self._current_locale.locale:
+            return
+
+        self._current_locale.locale = locale_str
+
+    @Gtk.Template.Callback()
+    def system_language_switched_cb(self, switch, _param):
+        if self._suppress_language_cb:
+            return
+
+        active = switch.get_active()
+        self.language_dropdown.set_sensitive(not active)
+
+        if active:
+            self._current_locale.locale = "None"
+        else:
+            idx = self.language_dropdown.get_selected()
+            if (idx != Gtk.INVALID_LIST_POSITION
+                    and idx < len(self._locale_list)):
+                self._current_locale.locale = self._locale_list[idx]
+
+    @Gtk.Template.Callback()
+    def change_model_clicked_cb(self, *_args):
+        backend = self._backend()
+        if not stt_backend_is_available(backend, refresh=True):
+            self._present_install_dialog(backend)
+            return
+
+        if self._model is None:
+            self._reload_backend()
+
+        if self._model != None:
+            dialog = STTModelChooserDialog(model=self._model)
+            dialog.set_transient_for(self)
+            dialog.present()
+
+    def _locale_changed_cb(self, _current_locale):
+        if self.system_language_switch.get_active() != self._current_locale.default_locale:
+            self._suppress_language_cb = True
+            self.system_language_switch.set_active(
+                self._current_locale.default_locale)
+            self._suppress_language_cb = False
+
+        self.language_dropdown.set_sensitive(
+            not self._current_locale.default_locale)
+        self._select_current_locale_in_dropdown()
+
+        if self._current_locale.locale not in self._locale_list:
+            self._refresh_locale_dropdown()
+
+        self._init_model()
+        self._load_current_locale()
+
+        if self._model is not None and not self._model.available():
+            self._auto_prompt_model_download()
+
+    def _override_file_changed_cb(self, _current_locale, deleted):
+        if not deleted and not self._override_file_written:
+            LOG_MSG.debug("override file changed")
+            self._load_current_locale()
+        self._override_file_written = False
+
+    @Gtk.Template.Callback()
+    def new_formatting_file_button_clicked_cb(self, _button):
+        dialog = Gtk.FileChooserDialog(transient_for=self, title=_("Open Formatting File"), modal=True, action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(_("Cancel"), Gtk.ResponseType.CANCEL, _("Open"), Gtk.ResponseType.ACCEPT)
+        dialog.connect("response", self._open_locale_file_cb)
+        dialog.set_transient_for(self)
+        dialog.present()
+
+    def _open_locale_file_cb(self, dialog, response):
+        if response != Gtk.ResponseType.ACCEPT:
+            dialog.destroy()
+            return
+        f = dialog.get_file()
+        dialog.destroy()
+        self._current_locale.formatting_file_path(f.get_path())
+
+    @Gtk.Template.Callback()
+    def commands_row_activated_cb(self, _row):
+        self.category_stack.set_visible_child_name("commands")
+        self.main_stack.set_visible_child_name("category")
+
+    @Gtk.Template.Callback()
+    def case_row_activated_cb(self, _row):
+        self.category_stack.set_visible_child_name("case")
+        self.main_stack.set_visible_child_name("category")
+
+    @Gtk.Template.Callback()
+    def diacritics_row_activated_cb(self, _row):
+        self.category_stack.set_visible_child_name("diacritics")
+        self.main_stack.set_visible_child_name("category")
+
+    @Gtk.Template.Callback()
+    def punctuation_row_activated_cb(self, _row):
+        self.category_stack.set_visible_child_name("punctuation")
+        self.main_stack.set_visible_child_name("category")
+
+    @Gtk.Template.Callback()
+    def custom_row_activated_cb(self, _row):
+        self.category_stack.set_visible_child_name("custom")
+        self.main_stack.set_visible_child_name("category")
+
+    @Gtk.Template.Callback()
+    def back_button_clicked_cb(self, _button):
+        self.main_stack.set_visible_child_name("main")
+
+    def _empty_shortcut_page(self):
+        self._valid_formatting_file_path = False
+        self._valid_formatting_file = False
+        self._valid_override_file = False
+
+        for row in self._values_dict.values():
+            listbox = row.pref_group
+            listbox.remove(row)
+
+        self.commands_row.set_visible(False)
+        self.case_row.set_visible(False)
+        self.diacritics_row.set_visible(False)
+        self.punctuation_row.set_visible(False)
+
+        self._values_dict = {}
+        self._utterances_dict = {}
+
+    def _load_current_locale(self):
+        self._empty_shortcut_page()
+        self._load_utterances()
+        self._refresh_status_messages()
+
+    def _apply_change(self):
+        LOG_MSG.debug("override file being written")
+        self._override_file_written=True
+
+        json_data = {
+            "commands":    [],
+            "case":        [],
+            "diacritics":  [],
+            "punctuation": [],
+            "custom":      [],
+        }
+
+        write_changes=False
+        for row in self._values_dict.values():
+            value=row.get_json_data()
+            if value == None:
+                continue
+            write_changes=True
+            if row.pref_group == self.commandslistbox:
+                json_data["commands"].append(value)
+            elif row.pref_group == self.caselistbox:
+                json_data["case"].append(value)
+            elif row.pref_group == self.diacriticslistbox:
+                json_data["diacritics"].append(value)
+            elif row.pref_group == self.punctuationlistbox:
+                json_data["punctuation"].append(value)
+            elif row.pref_group == self.customlistbox:
+                json_data["custom"].append(value)
+
+        if write_changes == True:
+            self._current_locale.overriding=json_data
+
+    def shortcut_row_reset_cb(self, row):
+        # After a row is reset remove extra utterances from global dictionary
+        for utterance in row._extra_utterances:
+            self._utterances_dict.pop(utterance, None)
+        self._apply_change()
+
+    def shortcut_row_deleted_cb(self, row):
+        self._values_dict.pop(row.value, None)
+        for utterance in row.utterances:
+            self._utterances_dict.pop(utterance, None)
+        for utterance in row._extra_utterances:
+            self._utterances_dict.pop(utterance, None)
+        parent = row.get_parent()
+        parent.remove(row)
+        self._apply_change()
+
+    def shortcut_row_activated_cb(self, row):
+        self._present_shortcut_dialog(row)
+
+    def _present_shortcut_dialog(self, row):
+        # This is the only place that needs a live engine, so this is where it
+        # gets built. The model then loads asynchronously: the dialog starts
+        # out with recording disabled and enables it on "model-changed".
+        engine = self._ensure_engine()
+        if engine is None:
+            LOG_MSG.warning("no engine available, cannot edit shortcuts")
+            return
+
+        dialog = STTShortcutDialog(
+            row=row, engine=engine, transient_for=self)
+        dialog.connect("response", self._shortcut_dialog_response_cb)
+        dialog.present()
+
+    @Gtk.Template.Callback()
+    def new_shortcut_clicked_cb(self, _button):
+        self._present_shortcut_dialog(None)
+
+    def _shortcut_dialog_response_cb(self, dialog, response):
+        if response == Gtk.ResponseType.APPLY:
+            (added, removed) = dialog.apply_to_row()
+            for u in added:
+                self._utterances_dict[u] = True
+            for u in removed:
+                self._utterances_dict.pop(u, None)
+            self._apply_change()
+        elif response == Gtk.ResponseType.OK:
+            # Addition
+            row = dialog.get_new_row()
+            row.pref_group=self.customlistbox
+            self.customlistbox.add(row)
+            row.connect("activated", self.shortcut_row_activated_cb)
+            row.connect("delete", self.shortcut_row_deleted_cb)
+            row.connect("reset", self.shortcut_row_reset_cb)
+
+            # It can't be a diacritic sign as the shortcut was created
+            self._values_dict[row.value]=row
+
+            # Only _extra_utterances can be added
+            for u in row._extra_utterances:
+                self._utterances_dict[u] = True
+            self._apply_change()
+        dialog.destroy()
+
+    def _load_section(self, json_data, section, listbox, cat_row):
+        item_list=json_data.get(section)
+        if item_list  in (None,[]):
+            if cat_row != None:
+                cat_row.set_visible(False)
+            return
+
+        if cat_row != None:
+            cat_row.set_visible(True)
+
+        for item in item_list:
+            value=item.get("value")
+            # It may happen with diacritics that it's a list
+            # The [0] is the non combining unicode (ie U+005E for circumflex)
+            # and [1] is the combining unicode character (ie U+0302 for circumflex)
+
+            utterances=item.get("utterances")
+            description=item.get("description")
+
+            # In case there is only one
+            if isinstance(utterances,str):
+                utterances = [utterances]
+
+            # Each occurrence has to be unique
+            for utterance in utterances[:]:
+                if self._utterances_dict.get(utterance, False):
+                    LOG_MSG.error("utterance already exists (%s)", utterance)
+                    utterances.remove(utterance)
+                    continue
+                self._utterances_dict[utterance] = True
+
+            key = value[0] if isinstance(value, list) else value
+            row = self._values_dict.get(key)
+
+            if row == None:
+                if utterances == []:
+                    continue
+                row=STTShortcutRow(value=value,
+                                   utterances=utterances,
+                                   description=description,
+                                   editable=False,
+                                   pref_group=listbox)
+                listbox.add(row)
+                row.connect("activated", self.shortcut_row_activated_cb)
+                row.connect("reset", self.shortcut_row_reset_cb)
+                self._values_dict[key] = row
+            else:
+                row.utterances  = list(set(row.utterances) | set(utterances))
+                row.description = description
+
+    def _load_section_override(self, item_list, listbox):
+        if item_list == None:
+            return
+
+        for item in item_list:
+            value=item.get("value")
+            # It may happen with diacritics that it's a list
+            # The [0] is the non combining unicode (ie U+005E for circumflex)
+            # and [1] is the combining unicode character (ie U+0302 for circumflex)
+
+            utterances=item.get("utterances")
+            description=item.get("description")
+            if utterances not in (None,[]):
+                # In case there is only one
+                if isinstance(utterances, str):
+                    utterances = [utterances]
+
+                # Each occurrence has to be unique
+                for utterance in utterances[:]:
+                    if self._utterances_dict.get(utterance, False):
+                        LOG_MSG.error("utterance already exists (%s)", utterance)
+                        utterances.remove(utterance)
+                        continue
+
+                    self._utterances_dict[utterance] = True
+
+            key = value[0] if isinstance(value, list) else value
+            row = self._values_dict.get(key)
+
+            if row != None:
+                if description != None:
+                    row.description = description
+
+                if utterances not in (None,[]):
+                    row.add_extra_utterances(utterances)
+            elif utterances not in (None,[]):
+                row=STTShortcutRow(value=value,
+                                   extra_utterances=utterances,
+                                   description=description,
+                                   editable=True,
+                                   pref_group=listbox)
+                listbox.add(row)
+                row.connect("delete", self.shortcut_row_deleted_cb)
+                row.connect("reset", self.shortcut_row_reset_cb)
+                row.connect("activated", self.shortcut_row_activated_cb)
+                self._values_dict[key]=row
+
+    def _load_formatting_file(self):
+        # Load custom formatting file as well. Note: it overrides existing keys
+        LOG_MSG.debug("loading formatting file")
+        json_data = self._current_locale.formatting
+        if json_data is None:
+            return
+
+        self._load_section(json_data, "commands",    self.commandslistbox,    self.commands_row)
+        self._load_section(json_data, "case",        self.caselistbox,        self.case_row)
+        self._load_section(json_data, "diacritics",  self.diacriticslistbox,  self.diacritics_row)
+        self._load_section(json_data, "punctuation", self.punctuationlistbox, self.punctuation_row)
+        self._load_section(json_data, "custom",      self.customlistbox,      None)
+
+        self._valid_formatting_file = True
+
+    def _load_overriding_file(self):
+        LOG_MSG.debug("loading overriding file")
+        json_data=self._current_locale.overriding
+        if json_data == None:
+            return
+
+        # Now add overrides
+        self._load_section_override(json_data.get("commands"), self.commandslistbox)
+        self._load_section_override(json_data.get("case"), self.caselistbox)
+        self._load_section_override(json_data.get("diacritics"), self.diacriticslistbox)
+        self._load_section_override(json_data.get("punctuation"), self.punctuationlistbox)
+        self._load_section_override(json_data.get("custom"), self.customlistbox)
+
+        self._valid_override_file=True
+
+    def _load_utterances(self):
+        self._load_formatting_file()
+        if self._valid_formatting_file == False:
+            self._empty_shortcut_page()
+
+        self._load_overriding_file()
+
+    def _manage_model_action_activated(self, _action, _param):
+        self._auto_prompt_model_download()
+
+    def _toast_dismissed(self, toast):
+        if toast == self._missing_deps_toast:
+            self._missing_deps_toast=None
+        elif toast == self._no_model_toast:
+            self._no_model_toast=None
+
+            # Display the other message if needed
+            if self._valid_formatting_file == False:
+                self._unsupported_locale()
+        else:
+            self._unsupported_locale_toast=None
+
+    def _unsupported_locale(self):
+        # Careful: we can have no formatting file but an overriding one !!
+        if self._missing_deps_toast != None:
+            return
+
+        if self._no_model_toast != None:
+            return
+
+        # Formatting files only exist for vosk; other engines have no files to find
+        if self._backend() != "vosk":
+            if self._unsupported_locale_toast is not None:
+                self._unsupported_locale_toast.dismiss()
+                self._unsupported_locale_toast = None
+            return
+
+        if self._unsupported_locale_toast != None:
+            return
+
+        if self._valid_formatting_file_path:
+            msg = _("The formatting file for your locale has an invalid format.")
+        else:
+            msg = _("No formatting file found for your locale. "
+                    "You can add one manually.")
+
+        self._unsupported_locale_toast = Adw.Toast(title=msg, timeout=0)
+        self._unsupported_locale_toast.connect("dismissed", self._toast_dismissed)
+        self.toast_overlay.add_toast(self._unsupported_locale_toast)
+
+    def _engine_has_no_model(self):
+        if self._missing_deps_toast != None:
+            return
+
+        if self._no_model_toast != None:
+            return
+
+        if self._unsupported_locale_toast != None:
+            self._unsupported_locale_toast.dismiss()
+            self._unsupported_locale_toast = None
+
+        self._no_model_toast=Adw.Toast(title=_("No model available for current locale"), timeout=0, button_label=_("Download"), action_name="toast.manage_model")
+        self._no_model_toast.connect("dismissed", self._toast_dismissed)
+        self.toast_overlay.add_toast(self._no_model_toast)
+
+    def _engine_model_changed_cb(self, engine):
+        if engine.has_model() == False:
+            self._engine_has_no_model()
+        elif self._no_model_toast != None:
+            self._no_model_toast.dismiss()
+            self._no_model_toast = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 8
 --
