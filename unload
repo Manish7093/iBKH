@@ -1,3 +1,487 @@
+# vim:set et sts=4 sw=4:
+#
+# ibus-stt - Speech To Text engine for IBus
+# Copyright (C) 2022 Philippe Rouquier <bonfire-app@wanadoo.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import gc
+import logging
+import threading
+import queue
+import numpy as np
+
+from gi.repository import Gst, GLib
+from sttutils import *
+from sttgstbase import STTGstBase
+from sttcurrentlocale import stt_current_locale
+from sttonnxasrmodel import STTOnnxAsrModel
+from sttonnxasrmodelmanagers import ONNXASR_QUANTIZATION
+
+LOG_MSG = logging.getLogger()
+
+# Upper bound on how long stop() may wait for pending transcriptions.
+FINAL_DRAIN_TIMEOUT = 5.0
+
+MAX_PENDING_DURATION = 15.0
+
+SILENCE_RMS_THRESHOLD = 300.0
+SILENCE_CHUNKS_TO_CUT = 3
+
+# NOTE: onnx_asr (and onnxruntime underneath it) is deliberately NOT imported
+# at module level. "import onnxruntime" dlopen()s a large native library and
+# holds the GIL while doing so, and this module is imported from the IBus main
+# loop (STTGstFactory.new_engine()) and from the setup dialog
+# (stt_backend_component()). A top level import therefore freezes both
+# processes before any of the asynchronous loading below even starts. Same
+# lazy import pattern as sttgstmoonshine.
+
+
+def _session_options():
+    """onnxruntime SessionOptions tuned for a desktop input method."""
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+
+    # onnxruntime defaults to one intra-op thread per physical core and lets
+    # the pool spin while waiting for work. For a background input method that
+    # pins the whole machine during a chunk and keeps burning cycles between
+    # utterances, which is what starves gnome-shell and the setup dialog into
+    # "not responding".
+    opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+
+    # The BFC arena never hands memory back to the allocator, which defeats
+    # the malloc_trim(0) in STTGstBase.destroy(). The reuse it buys is not
+    # worth several hundred MB of retained RSS.
+    opts.enable_cpu_mem_arena = False
+
+    return opts
+
+
+def _load_recognizer(model_name):
+    """Build the recognizer. Only ever called from a loader thread."""
+    import onnx_asr
+
+    opts = _session_options()
+
+    if ONNXASR_QUANTIZATION:
+        try:
+            return onnx_asr.load_model(model_name,
+                                       quantization=ONNXASR_QUANTIZATION,
+                                       sess_options=opts)
+        except Exception as error:
+            LOG_MSG.info("no %s weights for %s (%s), falling back to fp32",
+                         ONNXASR_QUANTIZATION, model_name, error)
+
+    return onnx_asr.load_model(model_name, sess_options=opts)
+
+
+class STTGstOnnxAsr(STTGstBase):
+    __gtype_name__ = 'STTGstOnnxAsr'
+    _pipeline_def = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                    "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                    "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
+                    "queue ! " \
+                    "appsink name=OnnxAsrSink emit-signals=true sync=false"
+
+    _pipeline_def_alt = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+                        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
+                        "queue ! " \
+                        "appsink name=OnnxAsrSink emit-signals=true sync=false"
+
+    def __init__(self, current_locale=None):
+        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
+        if plugin is not None:
+            super().__init__(pipeline_definition=STTGstOnnxAsr._pipeline_def)
+            LOG_MSG.debug("using Webrtcdsp plugin")
+        else:
+            super().__init__(pipeline_definition=STTGstOnnxAsr._pipeline_def_alt)
+            LOG_MSG.debug("not using Webrtcdsp plugin")
+
+        if self.pipeline is None:
+            LOG_MSG.error("pipeline was not created")
+            return
+
+        self._appsink = self.pipeline.get_by_name("OnnxAsrSink")
+        if self._appsink is None:
+            LOG_MSG.error("no appsink element!")
+            return
+
+        self._appsink.connect("new-sample", self._on_new_sample)
+
+        if current_locale is None:
+            self._current_locale = stt_current_locale()
+        else:
+            self._current_locale = current_locale
+
+        self._locale_id = self._current_locale.connect("changed", self._locale_changed)
+
+        self._model_id = 0
+        self._model = None
+        self._recognizer = None
+        self._load_generation = 0
+
+        self._audio_buffer = []
+        self._buffer_duration = 0.0
+        self._max_buffer_duration = 12.0
+        self._min_buffer_duration = 2.0
+        self._sample_rate = 16000
+        self._silence_chunks = 0
+        self._speech_chunks = 0
+        self._processing = False
+        self._process_queue = queue.Queue()
+        self._process_thread = None
+        self._stop_processing = False
+
+        self._draining = False
+        self._drain_done = threading.Event()
+
+        self._use_partial_results = False
+        self._audio_lock = threading.Lock()
+
+        # Kept last: _set_model() starts the asynchronous model load, whose
+        # completion callback touches the state initialised above.
+        self._set_model()
+
+    def __del__(self):
+        LOG_MSG.info("OnnxAsr __del__")
+        self._stop_processing = True
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+            self._process_thread = None
+        super().__del__()
+
+    def destroy(self):
+        self._stop_processing = True
+        self._load_generation += 1   # invalidate any in-flight model load
+
+        # Drop anything still queued so the worker exits quickly.
+        while True:
+            try:
+                self._process_queue.get_nowait()
+                self._process_queue.task_done()
+            except queue.Empty:
+                break
+
+        thread_alive = False
+        if self._process_thread is not None:
+            self._process_thread.join(timeout=2.0)
+            thread_alive = self._process_thread.is_alive()
+            self._process_thread = None
+
+        self._current_locale.disconnect(self._locale_id)
+        self._locale_id = 0
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        # The managers hold references to the model's bound methods, so
+        # without an explicit teardown the model is never collected, __del__
+        # never runs and its custom path registration is never released.
+        if self._model is not None:
+            self._model.destroy()
+            self._model = None
+
+        self._appsink = None
+        # The worker keeps its own reference (recognizer local): only drop
+        # ours unconditionally, the session is freed when the last reference
+        # goes away.
+        if thread_alive:
+            LOG_MSG.warning("worker still transcribing, session freed later")
+        self._recognizer = None
+
+        LOG_MSG.info("OnnxAsr.destroy() called")
+
+        # engine <-> model <-> signal closure cycles keep the onnxruntime
+        # arena referenced; collect before STTGstBase.destroy() calls
+        # malloc_trim(0), otherwise nothing is returned to the allocator.
+        gc.collect()
+
+        super().destroy()
+
+    def _set_model_path(self):
+        if self._model is None or self._model.available() is False:
+            LOG_MSG.info("model not available (%s - %s)",
+                        self._model.get_name() if self._model else "None",
+                        self._model.get_path() if self._model else "None")
+            self._load_generation += 1
+            self._recognizer = None
+            self.emit("model-changed")
+            return
+
+        model_name = self._model.get_path()
+        LOG_MSG.debug("model ready %s", model_name)
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        # Load asynchronously: onnxruntime session creation takes several
+        # seconds and this runs in the IBus main loop (engine creation, locale
+        # change, model change). Blocking here froze the whole engine process,
+        # hanging the panel and the setup dialog until the load completed.
+        self._load_generation += 1
+        self._recognizer = None
+        threading.Thread(target=self._load_model_thread,
+                         args=(model_name, state, self._load_generation),
+                         daemon=True).start()
+
+    def _load_model_thread(self, model_name, restore_state, generation):
+        recognizer = None
+        try:
+            LOG_MSG.info("Loading onnx-asr model: %s", model_name)
+            recognizer = _load_recognizer(model_name)
+            LOG_MSG.info("onnx-asr model loaded successfully")
+        except Exception as e:
+            LOG_MSG.error("Failed to load onnx-asr model: %s", e)
+
+        GLib.idle_add(self._model_load_done_cb,
+                      recognizer, restore_state, generation)
+
+    def _model_load_done_cb(self, recognizer, restore_state, generation):
+        # The engine may have been destroyed, or the model/locale may have
+        # changed again while we were loading: drop stale results.
+        if self.pipeline is None or generation != self._load_generation:
+            LOG_MSG.debug("discarding stale model load")
+            return False
+
+        self._recognizer = recognizer
+
+        if recognizer is not None and restore_state > Gst.State.READY:
+            # Restore the previous pipeline state, unless something else
+            # changed it while we were loading.
+            ret, current, pending = self.pipeline.get_state(0)
+            if current == Gst.State.READY:
+                self.pipeline.set_state(restore_state)
+
+        self.emit("model-changed")
+        return False
+
+    def _model_changed(self, model):
+        self._set_model_path()
+
+    def _set_model(self):
+        if self._model is not None and \
+           self._model.get_locale() == self._current_locale.locale:
+            return
+
+        if self._model_id != 0:
+            self._model.disconnect(self._model_id)
+            self._model_id = 0
+
+        if self._model is not None:
+            self._model.destroy()
+
+        self._model = STTOnnxAsrModel(locale_str=self._current_locale.locale)
+        self._model_id = self._model.connect("changed", self._model_changed)
+        self._set_model_path()
+
+    def _locale_changed(self, locale):
+        self._set_model()
+
+    def _on_new_sample(self, appsink):
+        """Callback when new audio sample arrives."""
+        # While draining final results or tearing down, keep swallowing
+        # buffers but do not queue new work, otherwise the drain can never
+        # complete as long as the mic picks up sound.
+        if self._draining or self._stop_processing:
+            appsink.emit("pull-sample")
+            return Gst.FlowReturn.OK
+
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+
+        audio_data = np.frombuffer(map_info.data, dtype=np.int16)
+        buf.unmap(map_info)
+
+        with self._audio_lock:
+            self._audio_buffer.append(audio_data)
+            self._buffer_duration += len(audio_data) / self._sample_rate
+
+            if audio_data.size:
+                rms = float(np.sqrt(np.mean(
+                    np.square(audio_data.astype(np.float32)))))
+            else:
+                rms = 0.0
+
+            if rms < SILENCE_RMS_THRESHOLD:
+                self._silence_chunks += 1
+            else:
+                self._silence_chunks = 0
+                self._speech_chunks += 1
+
+            trigger_process = (
+                (self._buffer_duration >= self._min_buffer_duration
+                 and self._speech_chunks > 0
+                 and self._silence_chunks >= SILENCE_CHUNKS_TO_CUT)
+                or self._buffer_duration >= self._max_buffer_duration)
+
+        if trigger_process:
+            self._process_audio_buffer()
+
+        return Gst.FlowReturn.OK
+
+    def _process_audio_buffer(self, force=False):
+        """Process accumulated audio buffer."""
+        with self._audio_lock:
+            if len(self._audio_buffer) == 0:
+                return
+
+            if not force and self._buffer_duration < self._min_buffer_duration:
+                LOG_MSG.debug("Buffer too short (%.2fs), waiting for more audio", self._buffer_duration)
+                return
+
+            if self._recognizer is None:
+                if self._buffer_duration >= MAX_PENDING_DURATION:
+                    LOG_MSG.warning("onnx-asr model not loaded, dropping %.2fs",
+                                    self._buffer_duration)
+                    self._audio_buffer.clear()
+                    self._buffer_duration = 0.0
+                    self._silence_chunks = 0
+                    self._speech_chunks = 0
+                return
+
+            if self._speech_chunks == 0:
+                self._audio_buffer.clear()
+                self._buffer_duration = 0.0
+                self._silence_chunks = 0
+                return
+
+            audio = np.concatenate(self._audio_buffer)
+            self._audio_buffer.clear()
+            self._buffer_duration = 0.0
+            self._silence_chunks = 0
+            self._speech_chunks = 0
+
+            LOG_MSG.debug("Processing audio buffer: %d samples (%.2f seconds)",
+                         len(audio), len(audio) / self._sample_rate)
+
+            audio_float = audio.astype(np.float32) / 32768.0
+
+            self._process_queue.put(audio_float)
+
+            if self._process_thread is None or not self._process_thread.is_alive():
+                self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
+                self._process_thread.start()
+
+    def _process_worker(self):
+        """Background worker to process audio."""
+        while not self._stop_processing:
+            try:
+                audio = self._process_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            recognizer = self._recognizer
+            if recognizer is None:
+                self._process_queue.task_done()
+                if self._process_queue.unfinished_tasks == 0:
+                    self._drain_done.set()
+                continue
+
+            try:
+                LOG_MSG.debug("Starting transcription of %d samples", len(audio))
+
+                text = recognizer.recognize(audio, sample_rate=self._sample_rate)
+
+                if isinstance(text, str):
+                    text = text.strip()
+
+                if text:
+                    LOG_MSG.info("onnx-asr transcription result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
+                else:
+                    LOG_MSG.debug("No text transcribed from audio")
+
+            except Exception as e:
+                LOG_MSG.error("onnx-asr transcription error: %s", e, exc_info=True)
+
+            self._process_queue.task_done()
+            if self._process_queue.unfinished_tasks == 0:
+                self._drain_done.set()
+
+            # Do not hold the session across the next blocking get(): this
+            # local reference would otherwise keep it alive past destroy().
+            recognizer = None
+
+    def _emit_text(self, text):
+        self.emit("text", text)
+        return False
+
+    def get_final_results(self):
+        # Bounded, event-based drain. Queue.join() here could block the main
+        # loop indefinitely since the pipeline is still PLAYING at this point
+        # and kept feeding the queue being joined.
+        self._draining = True
+        try:
+            self._process_audio_buffer(force=True)
+
+            self._drain_done.clear()
+            if self._process_queue.unfinished_tasks == 0:
+                return
+            if self._drain_done.wait(FINAL_DRAIN_TIMEOUT) is False:
+                LOG_MSG.warning("timed out draining pending transcriptions")
+        finally:
+            self._draining = False
+
+    def get_results(self):
+        pass
+
+    def set_use_partial_results(self, active):
+        self._use_partial_results = active
+
+    def set_alternatives_num(self, num):
+        pass
+
+    def has_model(self):
+        if self._model is None or self._model.available() is False:
+            return False
+        return super().has_model()
+
+    def _stop_real(self):
+        self.get_final_results()
+        return super()._stop_real()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Sttgstonnxasr 
 
 # vim:set et sts=4 sw=4:
