@@ -1,3 +1,161 @@
+{
+    "description" : {
+        "name" : "हिन्दी (भारत)",
+        "locale" : "hi_IN",
+        "comment" : "Utterances are in Devanagari, with common English loan words as alternatives (कॉमा, न्यू लाइन). Hindi has no letter case, so the case section is empty."
+    },
+    "language" : {
+        "no space before" : " ….,)]}'-\t\n?!;:।॥",
+        "no space after" : " ([{@\n\t-",
+        "capitalize next" : ".?!…।",
+        "digits" : {
+            "शून्य" : "0",
+            "एक" : "1",
+            "दो" : "2",
+            "तीन" : "3",
+            "चार" : "4",
+            "पांच" : "5",
+            "पाँच" : "5",
+            "छह" : "6",
+            "छः" : "6",
+            "सात" : "7",
+            "आठ" : "8",
+            "नौ" : "9"
+        }
+    },
+    "custom" : [{
+        "shortcut" : "Control+v",
+        "description" : "Paste the text",
+        "utterances" : ["पेस्ट करो", "पेस्ट करें"]
+        }, {
+        "shortcut" : "Control+BackSpace",
+        "description" : "Delete the word on the left",
+        "utterances" : ["पिछला शब्द मिटाओ", "पिछला शब्द मिटाएं"]
+        }, {
+        "shortcut" : "Control+z",
+        "description" : "Undo last action",
+        "utterances" : ["अनडू करो", "अनडू करें"]
+        }, {
+        "shortcut" : "Return",
+        "description" : "Validate (= press 'Enter')",
+        "utterances" : ["एंटर दबाओ", "एंटर दबाएं"]
+        }, {
+        "shortcut" : "Shift+Control+Delete",
+        "description" : "Delete the line",
+        "utterances" : ["पूरी लाइन मिटाओ", "पूरी लाइन मिटाएं"]
+        }],
+    "commands" : [{
+        "value" : "digits",
+        "utterances" : ["अंक मोड"],
+        "description" : "Toggle use of digits"
+        }, {
+        "value" : "spelling",
+        "utterances" : ["वर्तनी मोड", "स्पेलिंग मोड"],
+        "description" : "Start spelling mode"
+        }, {
+        "value" : "dictation",
+        "utterances" : ["डिक्टेशन मोड", "श्रुतलेख मोड", "डिक्टेशन शुरू करो", "डिक्टेशन शुरू करें"],
+        "description" : "Start dictation mode"
+        }, {
+        "value" : "literal",
+        "utterances" : ["बिना फॉर्मेटिंग डिक्टेशन", "फॉर्मेटिंग के बिना डिक्टेशन"],
+        "description" : "Start dictation without formatting"
+        }, {
+        "value" : "cancel",
+        "utterances" : ["पिछला रद्द करो", "पिछला रद्द करें"],
+        "description" : "Cancel last utterance"
+        }],
+    "case" : [],
+    "diacritics" : [],
+    "punctuation" : [{
+        "value" : "।",
+        "utterances" : ["पूर्ण विराम"],
+        "description" : "Danda (Hindi full stop)"
+        }, {
+        "value" : ".",
+        "utterances" : ["फुल स्टॉप"],
+        "description" : "Latin full stop"
+        }, {
+        "value" : ",",
+        "utterances" : ["अल्प विराम", "कॉमा"]
+        }, {
+        "value" : ";",
+        "utterances" : ["अर्ध विराम", "सेमीकोलन"]
+        }, {
+        "value" : ":",
+        "utterances" : ["उप विराम", "कोलन"]
+        }, {
+        "value" : "?",
+        "utterances" : ["प्रश्नवाचक चिह्न", "प्रश्न चिह्न", "प्रश्न चिन्ह", "क्वेश्चन मार्क"]
+        }, {
+        "value" : "!",
+        "utterances" : ["विस्मयादिबोधक चिह्न", "विस्मय चिह्न", "विस्मय चिन्ह", "एक्सक्लेमेशन मार्क"]
+        }, {
+        "value" : "…",
+        "utterances" : ["तीन बिंदु"]
+        }, {
+        "value" : "-",
+        "utterances" : ["योजक चिह्न", "हाइफन"]
+        }, {
+        "value" : "–",
+        "utterances" : ["डैश"]
+        }, {
+        "value" : "\"",
+        "utterances" : ["उद्धरण चिह्न", "कोटेशन मार्क"]
+        }, {
+        "value" : "(",
+        "utterances" : ["कोष्ठक खोलो", "कोष्ठक खोलें", "ब्रैकेट खोलो"]
+        }, {
+        "value" : ")",
+        "utterances" : ["कोष्ठक बंद करो", "कोष्ठक बंद करें", "ब्रैकेट बंद करो"]
+        }, {
+        "value" : " ",
+        "utterances" : ["स्पेस"],
+        "description" : "Space"
+        }, {
+        "value" : "\t",
+        "utterances" : ["टैब"],
+        "description" : "Tabulation"
+        }, {
+        "value" : "\n",
+        "utterances" : ["नई लाइन", "नई पंक्ति", "न्यू लाइन"],
+        "description" : "New line"
+        }, {
+        "value" : "@",
+        "utterances" : ["एट द रेट", "ऐट द रेट"]
+        }, {
+        "value" : "/",
+        "utterances" : ["स्लैश"]
+        }, {
+        "value" : "+",
+        "utterances" : ["प्लस चिह्न"]
+        }, {
+        "value" : "=",
+        "utterances" : ["बराबर चिह्न"]
+        }, {
+        "value" : "%",
+        "utterances" : ["प्रतिशत चिह्न"]
+        }, {
+        "value" : "₹",
+        "utterances" : ["रुपये का चिह्न"]
+    }]
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 engine/sttconfigdialog.py
 
 import logging
