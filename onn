@@ -1,3 +1,135 @@
+engine/sttconfigdialog.py
+
+import logging
+ import locale
+ 
++from pathlib import Path
++
+ from gettext import gettext as _
+
+
+Change the template children:
+
+diff
+-    voice_commands_box   = Gtk.Template.Child()
++    vc_unavailable_box   = Gtk.Template.Child()
++    vc_unavailable_label = Gtk.Template.Child()
++    voice_commands_group = Gtk.Template.Child()
+
+
+
+
+Replace the body of _update_voice_commands_visibility and add a helper below it:
+
+diff
+     def _update_voice_commands_visibility(self):
+         # Voice commands depend on the locale formatting and override files,
+-        # not on the backend: only offer the tab when one of them is loaded.
++        # not on the backend: disable them when neither file is loaded.
+         available = self._valid_formatting_file or self._valid_override_file
+-        self.tab_stack.get_page(self.voice_commands_box).set_visible(available)
+-        self.tab_switcher.set_visible(available)
++        self.vc_unavailable_box.set_visible(not available)
++        self.voice_commands_group.set_sensitive(available)
+ 
+         if not available:
+-            self.tab_stack.set_visible_child_name("setup")
++            self.vc_unavailable_label.set_label(
++                _("Voice commands are not available for this language. "
++                  "They are available for: %s.")
++                % ", ".join(self._voice_command_language_names()))
+             self.main_stack.set_visible_child_name("main")
+ 
++    def _voice_command_language_names(self):
++        # One name per formatting file shipped in data/formatting
++        system_locale_str = locale.getlocale()[0]
++        formatting_dir = Path(stt_utils_get_system_data_path(), "formatting")
++        names = []
++        for json_path in sorted(formatting_dir.glob("*.json")):
++            try:
++                names.append(Locale.parse(json_path.stem)
++                             .get_display_name(system_locale_str))
++            except (UnknownLocaleError, ValueError):
++                names.append(json_path.stem)
++        return names
+
+
+Revert the toast text, because the manual path exists again:
+
+diff
+             msg = _("No formatting file found for your locale. "
+-                    "Voice commands are not available.")
++                    "You can add one manually.")
+
+
+engine/sttconfigdialog.ui
+
+Insert this inside voice_commands_box, directly before the <child> that holds voice_commands_group:
+
+xml
+<child>
+  <object class="GtkBox" id="vc_unavailable_box">
+    <property name="visible">False</property>
+    <property name="orientation">vertical</property>
+    <property name="spacing">12</property>
+    <property name="margin-top">24</property>
+    <property name="margin-bottom">12</property>
+    <child>
+      <object class="GtkImage">
+        <property name="icon-name">dialog-information-symbolic</property>
+        <property name="pixel-size">48</property>
+        <property name="halign">center</property>
+        <style><class name="dim-label"/></style>
+      </object>
+    </child>
+    <child>
+      <object class="GtkLabel">
+        <property name="label" translatable="yes">Not Available</property>
+        <property name="halign">center</property>
+        <style><class name="title-2"/></style>
+      </object>
+    </child>
+    <child>
+      <object class="GtkLabel" id="vc_unavailable_label">
+        <property name="halign">center</property>
+        <property name="justify">center</property>
+        <property name="wrap">True</property>
+        <property name="max-width-chars">40</property>
+        <property name="margin-start">24</property>
+        <property name="margin-end">24</property>
+        <style><class name="dim-label"/></style>
+      </object>
+    </child>
+    <child>
+      <object class="GtkButton">
+        <property name="label" translatable="yes">Load Formatting File…</property>
+        <property name="halign">center</property>
+        <signal name="clicked" handler="new_formatting_file_button_clicked_cb"/>
+        <style><class name="pill"/></style>
+      </object>
+    </child>
+  </object>
+</child>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 diff --git a/engine/sttconfigdialog.py b/engine/sttconfigdialog.py
 index 9e94e80..6cc230f 100644
 --- a/engine/sttconfigdialog.py
